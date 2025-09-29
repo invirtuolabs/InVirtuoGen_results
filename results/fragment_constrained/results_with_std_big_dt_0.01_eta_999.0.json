@@ -1,0 +1,87 @@
+{
+    "motif": {
+        "InVirtuoGen": {
+            "metrics": {
+                "quality": 32.8,
+                "diversity": 0.62,
+                "uniqueness": 95.49,
+                "validity": 66.53
+            },
+            "std": {
+                "quality": 0.6683312551921147,
+                "diversity": 0.006586409082130739,
+                "uniqueness": 0.5266591445757846,
+                "validity": 0.899382504215469
+            },
+            "smiles": []
+        }
+    },
+    "linker": {
+        "InVirtuoGen": {
+            "metrics": {
+                "quality": 16.57,
+                "diversity": 0.47,
+                "uniqueness": 75.97,
+                "validity": 44.7
+            },
+            "std": {
+                "quality": 0.3681787005729082,
+                "diversity": 0.002554179854476133,
+                "uniqueness": 1.279980065799671,
+                "validity": 0.5715476066494076
+            },
+            "smiles": []
+        }
+    },
+    "superstructure": {
+        "InVirtuoGen": {
+            "metrics": {
+                "quality": 30.57,
+                "diversity": 0.74,
+                "uniqueness": 99.36,
+                "validity": 74.9
+            },
+            "std": {
+                "quality": 1.1145502331533659,
+                "diversity": 0.0025180691573339427,
+                "uniqueness": 0.1616778324704269,
+                "validity": 0.5099019513592736
+            },
+            "smiles": []
+        }
+    },
+    "decoration": {
+        "InVirtuoGen": {
+            "metrics": {
+                "quality": 42.0,
+                "diversity": 0.55,
+                "uniqueness": 91.89,
+                "validity": 92.37
+            },
+            "std": {
+                "quality": 0.5715476066494105,
+                "diversity": 0.001539083040803973,
+                "uniqueness": 0.3579725648592798,
+                "validity": 0.2054804667656332
+            },
+            "smiles": []
+        }
+    },
+    "morphing": {
+        "InVirtuoGen": {
+            "metrics": {
+                "quality": 16.57,
+                "diversity": 0.47,
+                "uniqueness": 75.97,
+                "validity": 44.7
+            },
+            "std": {
+                "quality": 0.3681787005729082,
+                "diversity": 0.002554179854476133,
+                "uniqueness": 1.279980065799671,
+                "validity": 0.5715476066494076
+            },
+            "smiles": []
+        }
+    }
+}

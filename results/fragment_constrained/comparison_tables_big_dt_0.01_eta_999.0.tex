@@ -1,0 +1,37 @@
+\begin{table}[ht]
+  \centering
+  \caption{Performance across five fragment‐constrained generation tasks, averaged over three random seeds: motif extension, linker design, superstructure generation, scaffold morphing, and scaffold decoration. In our setup, similar as for GenMol, scaffold decoration is identical to linker design, so results are shared. }
+  \small
+  \setlength{\tabcolsep}{4pt} % reduce column padding
+  \renewcommand{\arraystretch}{1.2} % row height
+  \begin{tabularx}{\linewidth}{l l *{4}{>{\centering\arraybackslash}X}}
+    \toprule
+    Task & Method & Diversity & Quality & Uniqueness & Validity \\
+    \midrule
+    \multirow[c]{3}{*}{Motif Extension} & SAFE-GPT & $0.56 \pm 0.00$ & $18.60 \pm 2.10$ & $66.80 \pm 1.20$ & $\mathbf{96.10 \pm 1.90}$ \\
+     & GenMol & $\mathbf{0.62 \pm 0.00}$ & $30.10 \pm 0.40$ & $77.50 \pm 0.10$ & $82.90 \pm 0.10$ \\
+     & \rowcolor{gray!20}InVirtuoGen & $\mathbf{0.62 \pm 0.01}$ & $\mathbf{39.27 \pm 1.08}$ & $\mathbf{96.83 \pm 0.29}$ & $68.97 \pm 0.76$ \\
+    \midrule
+    \multirow[c]{3}{*}{Linker Design} & SAFE-GPT & $\mathbf{0.55 \pm 0.01}$ & $\mathbf{21.70 \pm 1.10}$ & $82.50 \pm 1.90$ & $76.60 \pm 5.10$ \\
+     & GenMol & $\mathbf{0.55 \pm 0.00}$ & $\mathbf{21.90 \pm 0.40}$ & $\mathbf{83.70 \pm 0.50}$ & $\mathbf{100.00}$ \\
+     & \rowcolor{gray!20}InVirtuoGen & $0.52 \pm 0.00$ & $\mathbf{22.33 \pm 1.25}$ & $\mathbf{84.76 \pm 1.62}$ & $60.37 \pm 0.57$ \\
+    \midrule
+    \multirow[c]{3}{*}{Scaffold Morphing} & SAFE-GPT & $0.51 \pm 0.01$ & $16.70 \pm 2.30$ & $70.40 \pm 5.70$ & $58.90 \pm 6.80$ \\
+     & GenMol & $\mathbf{0.55 \pm 0.00}$ & $\mathbf{21.90 \pm 0.40}$ & $\mathbf{83.70 \pm 0.50}$ & $\mathbf{100.00}$ \\
+     & \rowcolor{gray!20}InVirtuoGen & $0.52 \pm 0.00$ & $\mathbf{22.33 \pm 1.25}$ & $\mathbf{84.76 \pm 1.62}$ & $60.37 \pm 0.57$ \\
+    \midrule
+    \multirow[c]{3}{*}{Superstructure Design} & SAFE-GPT & $0.57 \pm 0.03$ & $14.30 \pm 3.70$ & $83.00 \pm 5.90$ & $95.70 \pm 2.00$ \\
+     & GenMol & $0.60 \pm 0.01$ & $\mathbf{34.80 \pm 1.00}$ & $83.60 \pm 1.00$ & $\mathbf{97.50 \pm 0.90}$ \\
+     & \rowcolor{gray!20}InVirtuoGen & $\mathbf{0.73 \pm 0.00}$ & $29.67 \pm 1.09$ & $\mathbf{99.54 \pm 0.16}$ & $76.33 \pm 0.62$ \\
+    \midrule
+    \multirow[c]{3}{*}{Scaffold Decoration} & SAFE-GPT & $0.57 \pm 0.01$ & $10.00 \pm 1.40$ & $74.70 \pm 2.50$ & $\mathbf{97.70 \pm 0.30}$ \\
+     & GenMol & $\mathbf{0.59 \pm 0.00}$ & $31.80 \pm 0.50$ & $82.70 \pm 1.80$ & $96.60 \pm 0.80$ \\
+     & \rowcolor{gray!20}InVirtuoGen & $0.56 \pm 0.00$ & $\mathbf{36.37 \pm 1.10}$ & $\mathbf{88.58 \pm 1.13}$ & $90.70 \pm 0.62$ \\
+    \midrule
+    \multirow[c]{3}{*}{\textbf{Average}} & {SAFE-GPT} & $0.55 \pm 0.01$ & $16.26 \pm 1.03$ & $75.48 \pm 1.77$ & $85.00 \pm 1.79$ \\
+     & {GenMol} & $0.58 \pm 0.00$ & $28.10 \pm 0.26$ & $82.24 \pm 0.44$ & $\mathbf{95.40 \pm 0.24}$ \\
+     & \rowcolor{gray!20}{InVirtuoGen} & $\mathbf{0.59 \pm 0.00}$ & $\mathbf{29.99 \pm 0.54}$ & $\mathbf{90.89 \pm 0.40}$ & $71.35 \pm 0.33$ \\
+    \bottomrule
+  \end{tabularx}
+  \label{tab:task_model_comparison}
+\end{table}

@@ -1,0 +1,16 @@
+*/__pycache__/
+*.ipynb
+in_virtuo_reinforce/vocab
+*.pyc
+*.pyo
+wandb
+plots
+*.ckpt
+*qed_sa*
+*/vocab
+tables
+oracle
+checkpoints
+logs
+data
+

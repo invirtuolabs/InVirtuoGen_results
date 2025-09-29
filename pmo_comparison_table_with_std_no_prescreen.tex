@@ -1,0 +1,36 @@
+\begin{table}[ht]
+\centering
+\caption{The results of the best performing models on the PMO benchmark, where we quote the AUC-top10 averaged over 3 runs with standard deviations. The best results are highlighted in bold. Values within one standard deviation of the best are also marked in bold. The results for Genetic GFN \citep{kim2024geneticguidedgflownetssampleefficient} and Mol GA \citep{tripp2023geneticalgorithmsstrongbaselines} are taken from the respective papers. The other results are taken from the original PMO benchmark paper by \citep{gao2022sampleefficiencymattersbenchmark}.}
+\label{tab:prescreen}
+\begin{tabularx}{\linewidth}{l|>{\columncolor{gray!20}}p{2.2cm} Y Y Y }
+\toprule
+Oracle & InVirtuoGen (no prescreen) & Gen. GFN & Mol GA & REINVENT \\
+\midrule
+\small{albuterol similarity} & $\mathbf{0.950}$ {\tiny ($\pm$ 0.017)} & $\mathbf{0.949}$ {\tiny ($\pm$ 0.010)} & $0.896$ {\tiny ($\pm$ 0.035)} & $0.882$ {\tiny ($\pm$ 0.006)} \\
+\small{amlodipine mpo} & $0.733$ {\tiny ($\pm$ 0.043)} & $\mathbf{0.761}$ {\tiny ($\pm$ 0.019)} & $0.688$ {\tiny ($\pm$ 0.039)} & $0.635$ {\tiny ($\pm$ 0.035)} \\
+\small{celecoxib rediscovery} & $\mathbf{0.798}$ {\tiny ($\pm$ 0.028)} & $\mathbf{0.802}$ {\tiny ($\pm$ 0.029)} & $0.567$ {\tiny ($\pm$ 0.083)} & $0.713$ {\tiny ($\pm$ 0.067)} \\
+\small{deco hop} & $\mathbf{0.748}$ {\tiny ($\pm$ 0.109)} & $\mathbf{0.733}$ {\tiny ($\pm$ 0.109)} & $\mathbf{0.649}$ {\tiny ($\pm$ 0.025)} & $\mathbf{0.666}$ {\tiny ($\pm$ 0.044)} \\
+\small{drd2} & $\mathbf{0.985}$ {\tiny ($\pm$ 0.002)} & $0.974$ {\tiny ($\pm$ 0.006)} & $0.936$ {\tiny ($\pm$ 0.016)} & $0.945$ {\tiny ($\pm$ 0.007)} \\
+\small{fexofenadine mpo} & $\mathbf{0.845}$ {\tiny ($\pm$ 0.016)} & $\mathbf{0.856}$ {\tiny ($\pm$ 0.039)} & $\mathbf{0.825}$ {\tiny ($\pm$ 0.019)} & $0.784$ {\tiny ($\pm$ 0.006)} \\
+\small{gsk3b} & $\mathbf{0.952}$ {\tiny ($\pm$ 0.016)} & $0.881$ {\tiny ($\pm$ 0.042)} & $0.843$ {\tiny ($\pm$ 0.039)} & $0.865$ {\tiny ($\pm$ 0.043)} \\
+\small{isomers c7h8n2o2} & $\mathbf{0.968}$ {\tiny ($\pm$ 0.005)} & $\mathbf{0.969}$ {\tiny ($\pm$ 0.003)} & $0.878$ {\tiny ($\pm$ 0.026)} & $0.852$ {\tiny ($\pm$ 0.036)} \\
+\small{isomers c9h10n2o2pf2cl} & $0.874$ {\tiny ($\pm$ 0.013)} & $\mathbf{0.897}$ {\tiny ($\pm$ 0.007)} & $0.865$ {\tiny ($\pm$ 0.012)} & $0.642$ {\tiny ($\pm$ 0.054)} \\
+\small{jnk3} & $\mathbf{0.825}$ {\tiny ($\pm$ 0.016)} & $0.764$ {\tiny ($\pm$ 0.069)} & $0.702$ {\tiny ($\pm$ 0.123)} & $0.783$ {\tiny ($\pm$ 0.023)} \\
+\small{median1} & $0.342$ {\tiny ($\pm$ 0.008)} & $\mathbf{0.379}$ {\tiny ($\pm$ 0.010)} & $0.257$ {\tiny ($\pm$ 0.009)} & $0.356$ {\tiny ($\pm$ 0.009)} \\
+\small{median2} & $\mathbf{0.288}$ {\tiny ($\pm$ 0.008)} & $\mathbf{0.294}$ {\tiny ($\pm$ 0.007)} & $\mathbf{0.301}$ {\tiny ($\pm$ 0.021)} & $0.276$ {\tiny ($\pm$ 0.008)} \\
+\small{mestranol similarity} & $\mathbf{0.797}$ {\tiny ($\pm$ 0.033)} & $0.708$ {\tiny ($\pm$ 0.057)} & $0.591$ {\tiny ($\pm$ 0.053)} & $0.618$ {\tiny ($\pm$ 0.048)} \\
+\small{osimertinib mpo} & $\mathbf{0.870}$ {\tiny ($\pm$ 0.005)} & $0.860$ {\tiny ($\pm$ 0.008)} & $0.844$ {\tiny ($\pm$ 0.015)} & $0.837$ {\tiny ($\pm$ 0.009)} \\
+\small{perindopril mpo} & $\mathbf{0.645}$ {\tiny ($\pm$ 0.032)} & $0.595$ {\tiny ($\pm$ 0.014)} & $0.547$ {\tiny ($\pm$ 0.022)} & $0.537$ {\tiny ($\pm$ 0.016)} \\
+\small{qed} & $\mathbf{0.942}$ {\tiny ($\pm$ 0.000)} & $\mathbf{0.942}$ {\tiny ($\pm$ 0.000)} & $0.941$ {\tiny ($\pm$ 0.001)} & $0.941$ {\tiny ($\pm$ 0.000)} \\
+\small{ranolazine mpo} & $\mathbf{0.848}$ {\tiny ($\pm$ 0.010)} & $0.819$ {\tiny ($\pm$ 0.018)} & $0.804$ {\tiny ($\pm$ 0.011)} & $0.760$ {\tiny ($\pm$ 0.009)} \\
+\small{scaffold hop} & $\mathbf{0.589}$ {\tiny ($\pm$ 0.021)} & $\mathbf{0.615}$ {\tiny ($\pm$ 0.100)} & $\mathbf{0.527}$ {\tiny ($\pm$ 0.025)} & $\mathbf{0.560}$ {\tiny ($\pm$ 0.019)} \\
+\small{sitagliptin mpo} & $\mathbf{0.709}$ {\tiny ($\pm$ 0.029)} & $0.634$ {\tiny ($\pm$ 0.039)} & $0.582$ {\tiny ($\pm$ 0.040)} & $0.021$ {\tiny ($\pm$ 0.003)} \\
+\small{thiothixene rediscovery} & $\mathbf{0.625}$ {\tiny ($\pm$ 0.014)} & $0.583$ {\tiny ($\pm$ 0.034)} & $0.519$ {\tiny ($\pm$ 0.041)} & $0.534$ {\tiny ($\pm$ 0.013)} \\
+\small{troglitazone rediscovery} & $\mathbf{0.595}$ {\tiny ($\pm$ 0.053)} & $0.511$ {\tiny ($\pm$ 0.054)} & $0.427$ {\tiny ($\pm$ 0.031)} & $0.441$ {\tiny ($\pm$ 0.032)} \\
+\small{valsartan smarts} & $\mathbf{0.210}$ {\tiny ($\pm$ 0.297)} & $\mathbf{0.135}$ {\tiny ($\pm$ 0.271)} & $\mathbf{0.000}$ {\tiny ($\pm$ 0.000)} & $\mathbf{0.178}$ {\tiny ($\pm$ 0.358)} \\
+\small{zaleplon mpo} & $\mathbf{0.536}$ {\tiny ($\pm$ 0.006)} & $\mathbf{0.552}$ {\tiny ($\pm$ 0.033)} & $\mathbf{0.519}$ {\tiny ($\pm$ 0.029)} & $0.358$ {\tiny ($\pm$ 0.062)} \\
+\midrule
+\textbf{Sum} & $\mathbf{16.676}$ {\tiny ($\pm$ 0.256)} & 16.213 & 14.708 & 14.184 \\
+\bottomrule
+\end{tabularx}
+\end{table}
