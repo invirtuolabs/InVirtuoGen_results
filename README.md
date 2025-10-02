@@ -287,6 +287,8 @@ python -m in_virtuo_reinforce.ppo_docking --device 1 --start_t 0. --offspring_si
 ```bash
  python -m in_virtuo_reinforce.evaluation.results_table_lead --mode nosim --no_sim results/lead_optimization/no_sim_constraint
 ```
+## Hugging Face:
+Paper + Model also available at: https://huggingface.co/papers/2509.26405
 ## 📄 Citation
 If you use this work, please cite:
 
