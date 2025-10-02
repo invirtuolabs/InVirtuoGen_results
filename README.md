@@ -288,9 +288,17 @@ python -m in_virtuo_reinforce.ppo_docking --device 1 --start_t 0. --offspring_si
  python -m in_virtuo_reinforce.evaluation.results_table_lead --mode nosim --no_sim results/lead_optimization/no_sim_constraint
 ```
 ## 📄 Citation
+If you use this work, please cite:
 
-After Unblinding
-
+@misc{kaech2025refinedrugsdontcomplete,
+      title={Refine Drugs, Don't Complete Them: Uniform-Source Discrete Flows for Fragment-Based Drug Discovery},
+      author={Benno Kaech and Luis Wyss and Karsten Borgwardt and Gianvito Grasso},
+      year={2025},
+      eprint={2509.26405},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2509.26405},
+}
 ## 📧 Contact
 
-After Unblinding
+📬 info@invirtuolabs.com
