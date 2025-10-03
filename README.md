@@ -304,3 +304,12 @@ If you use this work, please cite:
 ## 📧 Contact
 
 📬 info@invirtuolabs.com
+
+
+## ⚖️ License and Terms of Use
+
+The InVirtuoGEN source code is licensed under the Creative Commons Attribution-Non-Commercial ShareAlike International License, Version 4.0 (CC-BY-NC-SA 4.0) (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+The InVirtuoGEN model parameters are made available under the InVirtuoGEN Model Parameters Terms of Use (the "Terms"); you may not use these except in compliance with the Terms. You may obtain a copy of the Terms at [WEIGHTS_TERMS_OF_USE.md](WEIGHTS_TERMS_OF_USE.md).
+
+Unless required by applicable law, InVirtuoGEN and its output are distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. You are solely responsible for determining the appropriateness of using InVirtuoGEN, or using or distributing its source code or output, and assume any and all risks associated with such use or distribution and your exercise of rights and obligations under the relevant terms. Output are predictions with varying levels of confidence and should be interpreted carefully. Use discretion before relying on, publishing, downloading or otherwise using the InVirtuoGEN Assets.
