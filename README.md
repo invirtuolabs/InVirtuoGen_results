@@ -1,5 +1,5 @@
 # InVirtuoGen: Uniform-Source Discrete Flows for Drug Discovery
-
+Repository to reproduce results from the [paper](https://arxiv.org/abs/2509.26405).
 ## 🚀 Quick Start
 
 ### Setup Environment
@@ -291,7 +291,7 @@ python -m in_virtuo_reinforce.ppo_docking --device 1 --start_t 0. --offspring_si
 Paper + Model also available at: https://huggingface.co/papers/2509.26405
 ## 📄 Citation
 If you use this work, please cite:
-
+```bash
 @misc{kaech2025refinedrugsdontcomplete,
       title={Refine Drugs, Don't Complete Them: Uniform-Source Discrete Flows for Fragment-Based Drug Discovery},
       author={Benno Kaech and Luis Wyss and Karsten Borgwardt and Gianvito Grasso},
@@ -299,8 +299,9 @@ If you use this work, please cite:
       eprint={2509.26405},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2509.26405},
+      url={https://arxiv.org/abs/2509.26405 },
 }
+```
 ## 📧 Contact
 
 📬 info@invirtuolabs.com
