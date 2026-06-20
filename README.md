@@ -14,8 +14,10 @@ We also provide a Dockerfile for aarch64-based environments - the results from t
 ### Download Checkpoints
 ```bash
 mkdir checkpoints && cd checkpoints
-curl https://zenodo.org/api/records/16874868/files-archive -o checkpoints.zip
-unzip checkpoints.zip && unzip invirtuo_gen_big.ckpt.zip && unzip invirtuo_gen.ckpt.zip
+mkdir checkpoints && cd checkpoints
+curl -L "https://zenodo.org/records/16874868/files/invirtuo_gen.ckpt.zip?download=1" -o invirtuo_gen.ckpt.zip
+curl -L "https://zenodo.org/records/16874868/files/invirtuo_gen_big.ckpt.zip?download=1" -o invirtuo_gen_big.ckpt.zip
+unzip invirtuo_gen.ckpt.zip && unzip invirtuo_gen_big.ckpt.zip
 cd ..
 ```
 
