@@ -96,13 +96,15 @@ def visualize_top_smiles(smiles_list, top_n=10, target="CC(C)(C)NCC(C1=CC(=C(C=C
     #    Adjust molsPerRow to fit nicely (e.g. 5 per row)
     opts = rdMolDraw2D.MolDrawOptions()
     opts.legendFontSize = 25  # Set legend font size here
-    opts.atomLabelFontSize = 14
     opts.bondLineWidth = 2
     img = Draw.MolsToGridImage(mols, legends=legends, molsPerRow=5, subImgSize=(300, 300), drawOptions=opts)
     try:
-        img.save(f"plots/tdc/{oracle_name}/top_smiles_{device}.pdf" if not prefix else f"plots/tdc/{oracle_name}/{prefix}_{device}.pdf", format="pdf")
-    except:
-        pass
+        out_path = f"plots/tdc/{oracle_name}/top_smiles_{device}.png" if not prefix else f"plots/tdc/{oracle_name}/{prefix}_{device}.png"
+        img.save(out_path)
+        if wandb.run:
+            wandb.log({f"smiles/{prefix or 'top'}": wandb.Image(out_path)})
+    except Exception as e:
+        print(f"Could not save SMILES grid: {e}")
     plt.close()
 
 
@@ -400,32 +402,48 @@ class PeakSeekerBandit:
         pastel_colors = ["#AEC6CF", "#FFB347", "#98D8C8", "#F4B6C2"]
 
         fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+        # Every panel is indexed by the bandit's own arms, so they share one x axis and can
+        # be read against each other. Panel 1 used to histogram len(smiles_string) - SMILES
+        # characters - while the arms and every other panel are in tokens. Those differ by
+        # about 1.29x (~+10), which made the realized lengths look far below the sampling
+        # distribution when most of the gap was just the unit mismatch.
+        xlim = (x.min() - 1, x.max() + 1)
+        unit = "Sequence length (tokens)"
 
-        # Panel 1: Actual generated lengths histogram
-        if smiles_list:
-            lengths = [len(s) for s in smiles_list]
-            axs[0,0].hist(lengths, bins=range(min(lengths), max(lengths)+2),
-                        color=pastel_colors[0], edgecolor="gray", alpha=0.7)
-        axs[0,0].set_title("Generated Lengths")
-        axs[0,0].set_xlabel("Sequence length")
-        axs[0,0].set_ylabel("Count")
+        # Panel 1: how often each arm was actually realized, i.e. what the bandit has seen.
+        axs[0,0].bar(x, self.N, color=pastel_colors[0], edgecolor="gray", width=w, alpha=0.7)
+        if self.N.sum() > 0:
+            mean_len = float(np.average(x, weights=self.N))
+            axs[0,0].axvline(mean_len, color="darkblue", linestyle="--", linewidth=1.2,
+                             label=f"mean {mean_len:.1f}")
+            axs[0,0].legend(fontsize=8)
+        axs[0,0].set_title(f"Realized Lengths (n={int(self.N.sum())})")
+        axs[0,0].set_xlabel(unit)
+        axs[0,0].set_ylabel("Times observed")
 
         # Panel 2: Initial prior distribution
         axs[0,1].bar(x, self.prior, color=pastel_colors[1], edgecolor="gray", width=w, alpha=0.7)
+        axs[0,1].axvline(float(np.average(x, weights=self.prior)), color="darkorange",
+                         linestyle="--", linewidth=1.2,
+                         label=f"mean {float(np.average(x, weights=self.prior)):.1f}")
+        axs[0,1].legend(fontsize=8)
         axs[0,1].set_title("Initial Prior π₀")
-        axs[0,1].set_xlabel("Sequence length")
+        axs[0,1].set_xlabel(unit)
         axs[0,1].set_ylabel("Probability")
 
         # Panel 3: Current sampling distribution
         axs[1,0].bar(x, p_cur, color=pastel_colors[2], edgecolor="gray", width=w, alpha=0.7)
+        axs[1,0].axvline(float(np.average(x, weights=p_cur)), color="darkgreen",
+                         linestyle="--", linewidth=1.2,
+                         label=f"mean {float(np.average(x, weights=p_cur)):.1f}")
         # Highlight global best length if exists
         if self.Lbest is not None:
             best_idx = self._nearest_arm(self.Lbest)
             axs[1,0].bar(x[best_idx], p_cur[best_idx], color='red', edgecolor="darkred",
                         width=w, alpha=0.9, label=f'Best L={self.Lbest}')
-            axs[1,0].legend()
+        axs[1,0].legend(fontsize=8)
         axs[1,0].set_title("Current Sampling π")
-        axs[1,0].set_xlabel("Sequence length")
+        axs[1,0].set_xlabel(unit)
         axs[1,0].set_ylabel("Probability")
 
         # Make y-axes consistent for the two probability plots
@@ -433,35 +451,31 @@ class PeakSeekerBandit:
         axs[0,1].set_ylim(0, max_prob)
         axs[1,0].set_ylim(0, max_prob)
 
-        # Panel 4: Peak metrics - best rewards and quantiles
-        x_pos = np.arange(len(x))
-        width = 0.35
-
-        # Only plot for visited arms
+        # Panel 4: Peak metrics - best rewards and quantiles, on the real length axis rather
+        # than arm indices, so a peak here lines up with the same x in the other panels.
+        width = 0.4 * w
         visited = self.N > 0
         if np.any(visited):
-            axs[1,1].bar(x_pos[visited] - width/2, self.best[visited], width,
+            axs[1,1].bar(x[visited] - width/2, self.best[visited], width,
                         label='Best reward', color=pastel_colors[3], edgecolor="gray", alpha=0.7)
-            axs[1,1].bar(x_pos[visited] + width/2, self.qhat[visited], width,
+            axs[1,1].bar(x[visited] + width/2, self.qhat[visited], width,
                         label=f'q={self.q:.1f} quantile', color=pastel_colors[2], edgecolor="gray", alpha=0.7)
 
             # Mark global best
             if self.Lbest is not None:
-                best_idx = self._nearest_arm(self.Lbest)
-                axs[1,1].scatter(x_pos[best_idx], self.best[best_idx],
+                axs[1,1].scatter(self.Lbest, self.best[self._nearest_arm(self.Lbest)],
                                color='red', s=100, zorder=5, marker='*',
-                               label=f'Global best: {self._rbest:.3f}')
+                               label=f'Global best: {self._rbest:.3f} @ L={self.Lbest}')
 
         axs[1,1].set_title("Peak Metrics (Best & Quantiles)")
-        axs[1,1].set_xlabel("Sequence length")
+        axs[1,1].set_xlabel(unit)
         axs[1,1].set_ylabel("Reward")
-        axs[1,1].set_xticks(x_pos[::max(1, len(x)//10)])  # Show subset of ticks if many arms
-        axs[1,1].set_xticklabels(x[::max(1, len(x)//10)])
         axs[1,1].set_ylim(0, 1.05)
         axs[1,1].legend(loc='upper right', fontsize=8)
 
         # Light grid for readability
         for ax in axs.flatten():
+            ax.set_xlim(*xlim)
             ax.grid(axis="y", linestyle="--", alpha=0.3)
             ax.set_axisbelow(True)
 
@@ -469,7 +483,7 @@ class PeakSeekerBandit:
         plt.tight_layout()
 
         if log_wandb and wandb and wandb.run:
-            wandb.log({"bandit_distribution": wandb.Image(plt)}, step=global_step)
+            wandb.log({"bandit_distribution": wandb.Image(plt)})
 
         if save_path:
             plt.savefig(save_path, dpi=100, bbox_inches='tight')
@@ -579,7 +593,7 @@ class SoftmaxBandit:
         plt.tight_layout()
 
         if log_wandb and wandb.run:
-            wandb.log({"bandit_distribution": wandb.Image(plt)}, step=global_step)
+            wandb.log({"bandit_distribution": wandb.Image(plt)})
 
         if save_path:
             plt.savefig(save_path, dpi=100, bbox_inches='tight')
@@ -626,6 +640,9 @@ class GeneticPrompter:
         self.min_tanimoto_dist = min_tanimoto_dist
         self.score_based = score_based
         self.vocab_size = vocab_size
+        # When False, prompts are not combined via crossover: each offspring is
+        # seeded from a single (rank-based, best-performing) vocab entry.
+        self.combine_prompts = True
         # vocab of fragments (with attachment points)
 
     def update_with_score(self, smiles: str, score: float) -> None:
@@ -668,17 +685,42 @@ class GeneticPrompter:
                 del self.vocab_fps[highest_sim_key]
                 self.vocab[frag_key] = score
                 self.vocab_fps[frag_key] = (fp_new, score)
+                self._dedup()
             return  # Exit early - just replace if similar molecule exists
 
         self.vocab[frag_key] = score
         self.vocab_fps[frag_key] = (fp_new, score)
 
         # prune vocab to top‐K, and keep fps in sync
+        self._dedup()
         self._prune(self.vocab)
         keep = set(self.vocab)
         for k in list(self.vocab_fps):
             if k not in keep:
                 del self.vocab_fps[k]
+
+    def _dedup(self) -> None:
+        """
+        Drop vocab entries that sit within the similarity threshold of a better-scoring one.
+
+        The insertion check above only compares a newcomer against its single nearest
+        neighbour, so a molecule that replaces that neighbour can still land within the
+        threshold of some other entry. Unchecked, that drifts the vocab back towards the
+        near-duplicates the threshold exists to prevent, so sweep the whole set after every
+        insertion and keep the higher score of any offending pair.
+        """
+        threshold = 1.0 - self.min_tanimoto_dist
+        if threshold >= 1.0:
+            return  # dedup disabled: no similarity can exceed 1.0
+        # Best-scoring first, so the survivor of a colliding pair is the one already kept.
+        ordered = sorted(self.vocab_fps.items(), key=lambda kv: kv[1][1], reverse=True)
+        kept_fps = []
+        for key, (fp, _score) in ordered:
+            if any(DataStructs.TanimotoSimilarity(fp, fp_kept) > threshold for fp_kept in kept_fps):
+                del self.vocab[key]
+                del self.vocab_fps[key]
+            else:
+                kept_fps.append(fp)
 
     def pad_seqs(self, seqs: List[torch.Tensor]) -> torch.Tensor:
         """Pad list of 1D tensors to same length using pad token."""
@@ -716,6 +758,9 @@ class GeneticPrompter:
 
 
             i1, i2 = rank_based_sampling(self.vocab, 2, kappa=self.kappa, start_rank=self.start_rank    )
+            if not self.combine_prompts:
+                # stage 2: seed from a single best-performing prompt (no crossover)
+                i2 = i1
             i1 = torch.tensor(i1)
             i2 = torch.tensor(i2)
             p1_list.append(i1)
@@ -741,8 +786,11 @@ class GeneticPrompter:
         Fragment-level crossover to flat token-ID list.
         """
         smi1 = bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, p1_ids).split())
-        smi2 = bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, p2_ids).split())
         fr1 = decompose_smiles(smi1, self.max_frags, sort=True)
+        if not self.combine_prompts:
+            # stage 2: use the single selected prompt as the start point, no crossover
+            return self.tokenizer.encode(" ".join(fr1))[:n_oracle]
+        smi2 = bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, p2_ids).split())
         fr2 = decompose_smiles(smi2, self.max_frags, sort=True)
         if random.random() < 0.5:
             random.shuffle(fr1)

@@ -81,11 +81,16 @@ if __name__ == '__main__':
                  'zaleplon_mpo']
 
 
-    # prepare smiles once
-    samples = pd.read_csv(args.datapath, header=None)
-    smiles_list = samples.iloc[:, 0].tolist()
-    smiles = [bridge_smiles_fragments(s.split()) for s in smiles_list]
-    df = pd.DataFrame({'smiles': smiles})
+    # prepare smiles once, or resume from a partially-scored outfile so a restart
+    # continues from the properties already computed instead of re-scoring everything.
+    if args.resume and os.path.exists(args.outpath):
+        df = pd.read_csv(args.outpath)
+        print(f'Resuming from {args.outpath} with columns: {list(df.columns)}')
+    else:
+        samples = pd.read_csv(args.datapath, header=None)
+        smiles_list = samples.iloc[:, 0].tolist()
+        smiles = [bridge_smiles_fragments(s.split()) for s in smiles_list]
+        df = pd.DataFrame({'smiles': smiles})
 
     for prop in props:
         if prop not in df.columns:

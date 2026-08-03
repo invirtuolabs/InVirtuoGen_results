@@ -222,8 +222,14 @@ def compute_single_property(smiles):
     if mol is None:
         return None
 
-    sa_score = sascorer.calculateScore(mol)
-    qed_value = QED.qed(mol)
+    # QED.qed re-sanitizes via Chem.RemoveHs, which raises KekulizeException on molecules
+    # that MolFromSmiles accepted but cannot be kekulized. Treat those like unparseable
+    # input rather than letting them abort the caller.
+    try:
+        sa_score = sascorer.calculateScore(mol)
+        qed_value = QED.qed(mol)
+    except Exception:
+        return None
 
     return sa_score, qed_value
 

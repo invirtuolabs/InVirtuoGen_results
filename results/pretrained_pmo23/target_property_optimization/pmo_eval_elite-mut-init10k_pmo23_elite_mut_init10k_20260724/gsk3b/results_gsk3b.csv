@@ -1,0 +1,2 @@
+timestamp,best_score,auc_top10,auc_top100,predicted_auc,seed
+2026-07-24T22:10:31.528065,1.0,0.9992,0.853067,0.9992,0.0

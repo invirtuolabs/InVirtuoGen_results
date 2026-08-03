@@ -8,6 +8,8 @@ parser.add_argument("--results_root", type=str, default="lead_optimization")
 parser.add_argument("--reference_table", type=str, default="references/reference_pmo.csv")
 parser.add_argument("--exclude_prescreen", action="store_true", help="Exclude GenMol and f-RAG from the table")
 parser.add_argument("--include_std", action="store_true", help="Include standard deviations in the table")
+parser.add_argument("--unlimited_oracle_calls", action="store_true", help="Compare against Graph-GRPO (unlimited-oracle-call regime) instead of the standard PMO baselines")
+parser.add_argument("--use_prescreen", action="store_true", help="With --unlimited_oracle_calls, use Graph-GRPO's WITH-prescreening numbers (default is w/o prescreening)")
 # New arguments for ablation study mode
 parser.add_argument("--ablation_mode", action="store_true", help="Run in ablation study mode (compare different runs without references)")
 parser.add_argument("--results_paths", nargs='+', type=str, help="List of results directories to compare (for ablation mode)")
@@ -162,7 +164,14 @@ else:
     reference = pd.read_csv(args.reference_table)
     reference["Oracle"] = reference["Oracle"].str.replace("_", " ")
 
-    if args.exclude_prescreen:
+    # Graph-GRPO comparison column: prescreen variant when --use_prescreen, else cold-start.
+    gg_col = "Graph-GRPO-prescreen" if args.use_prescreen else "Graph-GRPO"
+    gg_header = "Graph-GRPO (prescreen)" if args.use_prescreen else "Graph-GRPO"
+    ivg_header = "InVirtuoGen (prescreen)" if args.use_prescreen else "InVirtuoGen"
+
+    if args.unlimited_oracle_calls:
+        ref_methods = [gg_col]
+    elif args.exclude_prescreen:
         ref_methods = ["Genetic GFN", "Mol GA", "REINVENT", ]#"Graph GA"
     else:
         ref_methods = ["GenMol", "f-RAG"]
@@ -183,7 +192,12 @@ else:
 
     merged = pd.merge(summary, reference, on="Oracle", how="left")
     print("merged", merged)
-    if args.exclude_prescreen:
+    if args.unlimited_oracle_calls:
+        methods = ["mean10", gg_col]
+        std_methods = ["std10", f"{gg_col}_std"]
+        sum_std_methods = ["invirtuo_sum_std", f"{gg_col}_sum_std"]
+        latex_headers = [ivg_header, gg_header]
+    elif args.exclude_prescreen:
         methods = ["mean10", "Genetic GFN", "Mol GA", "REINVENT"]#, "Graph GA"
         std_methods = ["std10", "Genetic GFN_std", "Mol GA_std", "REINVENT_std", ]#"Graph GA_std"
         sum_std_methods = ["invirtuo_sum_std", "Genetic GFN_sum_std", "Mol GA_sum_std", "REINVENT_sum_std",] #"Graph GA_sum_std"
@@ -198,7 +212,13 @@ else:
     latex = []
     latex.append(r"\begin{table}[ht]")
     latex.append(r"\centering")
-    if args.exclude_prescreen:
+    if args.unlimited_oracle_calls:
+        _screen = "with prescreening ZINC250k" if args.use_prescreen else "without prescreening ZINC250k"
+        caption = r"\caption{Comparison against Graph-GRPO on the PMO benchmark in the unlimited-oracle-call regime (both " + _screen + r"). We report the AUC-top10 averaged over 3 runs"
+        if args.include_std:
+            caption += r" with standard deviations"
+        caption += r". The best results and those within one standard deviation of the best are highlighted in bold. The Graph-GRPO scores are taken from \citep{graphgrpo}.}"
+    elif args.exclude_prescreen:
         caption = r"\caption{The results of the best performing models on the PMO benchmark, where we quote the AUC-top10 averaged over 3 runs"
         if args.include_std:
             caption += r" with standard deviations"
@@ -209,7 +229,10 @@ else:
             caption += r" with standard deviations"
         caption += r". Best results and those within one standard deviation of the best are indicated in bold. The scores for $f$-RAG \citep{lee2024moleculegenerationfragmentretrieval} and GenMol \cite{genmol} are taken from the respective publications.}"
     latex.append(caption)
-    latex.append(r"\label{tab:no_prescreen} " if args.exclude_prescreen else r"\label{tab:prescreen}")
+    if args.unlimited_oracle_calls:
+        latex.append(r"\label{tab:unlimited_oracle_calls}")
+    else:
+        latex.append(r"\label{tab:no_prescreen} " if args.exclude_prescreen else r"\label{tab:prescreen}")
     latex.append(r"\begin{tabularx}{\linewidth}{l|>{\columncolor{gray!20}}p{2.2cm} "+("Y " * (len(methods)-1))+"}") if not args.ablation_mode else     latex.append(r"\begin{tabularx}{\linewidth}{l|p{2.2cm} "+("Y " * (len(methods)-1))+"}")
     latex.append(r"\toprule")
     latex.append("Oracle & " + " & ".join(latex_headers) + r" \\")
@@ -287,7 +310,9 @@ else:
     output_file = "pmo_comparison_table"
     if args.include_std:
         output_file += "_with_std"
-    if args.exclude_prescreen:
+    if args.unlimited_oracle_calls:
+        output_file += "_graphgrpo_prescreen" if args.use_prescreen else "_graphgrpo"
+    elif args.exclude_prescreen:
         output_file += "_no_prescreen"
     output_file += ".tex"
 

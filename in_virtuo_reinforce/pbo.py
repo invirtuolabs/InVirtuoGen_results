@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import random
 import lightning
 import matplotlib.pyplot as plt
@@ -17,6 +18,46 @@ import wandb
 import os
 import pandas as pd
 from datetime import datetime
+
+
+def _load_legacy_sklearn_forest(path):
+    """Load TDC's sklearn 0.23 activity models with modern sklearn."""
+    from sklearn.tree import _tree
+
+    class CompatTree(_tree.Tree):
+        def __setstate__(self, state):
+            nodes = state["nodes"]
+            if "missing_go_to_left" not in nodes.dtype.names:
+                dtype = np.dtype({
+                    "names": [*nodes.dtype.names, "missing_go_to_left"],
+                    "formats": [*(nodes.dtype.fields[name][0] for name in nodes.dtype.names), "u1"],
+                    "offsets": [*(nodes.dtype.fields[name][1] for name in nodes.dtype.names), nodes.dtype.itemsize],
+                    "itemsize": nodes.dtype.itemsize + 8,
+                })
+                converted = np.zeros(nodes.shape, dtype=dtype)
+                for name in nodes.dtype.names:
+                    converted[name] = nodes[name]
+                state["nodes"] = converted
+
+            values = state["values"]
+            totals = values.sum(axis=2, keepdims=True)
+            np.divide(values, totals, out=values, where=totals != 0)
+            super().__setstate__(state)
+
+    class CompatUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if (module, name) == ("sklearn.tree._tree", "Tree"):
+                return CompatTree
+            return super().find_class(module, name)
+
+    with open(path, "rb") as model_file:
+        model = CompatUnpickler(model_file).load()
+    model.estimator = model.base_estimator
+    for estimator in model.estimators_:
+        estimator.monotonic_cst = None
+    return model
+
+
 class Objdict(dict):
     def __getattr__(self, name):
         if name in self:
@@ -51,7 +92,7 @@ def top_auc(buffer, top_n, finish, freq_log, max_oracle_calls):
     sum += (len(buffer) - called) * (top_n_now + prev) / 2
     if finish and len(buffer) < max_oracle_calls:
         sum += (max_oracle_calls - len(buffer)) * top_n_now
-    return sum / len(buffer)
+    return sum / (max_oracle_calls if finish else len(buffer))
 
 
 class Oracle:
@@ -165,7 +206,7 @@ class Oracle:
             "diversity_top100": diversity_top100,
             "n_oracle": n_calls,
         }
-        wandb.log({"best_reachable_auc": best_reachable_auc, "predicted_auc": predicted_auc, "avg_top10": avg_top10})
+        wandb.log({"best_reachable_auc": best_reachable_auc, "predicted_auc": predicted_auc, "avg_top10": avg_top10, "num_oracle_calls": n_calls})
         self.avg_top10.append(avg_top10)
         self.num_calls.append(n_calls)
         plt.plot(self.num_calls, self.avg_top10)
@@ -173,7 +214,9 @@ class Oracle:
         plt.xlabel("Number of oracle calls")
         plt.ylabel("Average top-10 score")
         plt.title("Average top-10 score vs number of oracle calls, AUC: {:.2f}".format(current_auc / n_calls))
-        plt.xlim(0, self.max_oracle_calls)
+        # valsartan positive-seed search lifts the cap to inf; matplotlib rejects that
+        if np.isfinite(self.max_oracle_calls):
+            plt.xlim(0, self.max_oracle_calls)
         print(self.name)
         os.makedirs(f"plots/tdc/{self.name}", exist_ok=True)
         plt.savefig(f"plots/tdc/{self.name}/tdc_avg_top10{self.device}.png", format="png")
@@ -253,8 +296,7 @@ class BaseOptimizer:
         self.max_oracle_calls = max_oracle_calls
         self.freq_log = freq_log
         self.output_dir = output_dir
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         self.log_results = log_results
         self.oracle = Oracle(max_oracle_calls=max_oracle_calls, freq_log=freq_log, output_dir=output_dir, device=device)
         # if self.smi_file is not None:
@@ -321,8 +363,8 @@ class BaseOptimizer:
         # 1) Compute metrics
         self.sort_buffer()
         best_score = max(val[0] for val in self.mol_buffer.values())
-        auc10  = top_auc(self.mol_buffer, 10, False, self.freq_log, self.max_oracle_calls)
-        auc100 = top_auc(self.mol_buffer, 100, False, self.freq_log, self.max_oracle_calls)
+        auc10  = top_auc(self.mol_buffer, 10, True, self.freq_log, self.max_oracle_calls)
+        auc100 = top_auc(self.mol_buffer, 100, True, self.freq_log, self.max_oracle_calls)
         predicted_auc = self.oracle.predicted_auc
         # 2) Prepare output path
         out_dir = os.path.join(self.output_dir, self.oracle.name)
@@ -384,6 +426,14 @@ class BaseOptimizer:
 
     def optimize(self, oracle, config=None, patience=5, seed=0, project="test", **kwargs):
         if type(oracle) == str:
+            if oracle.lower() in {"gsk3b", "jnk3"}:
+                import importlib
+                from packaging.version import parse
+                import sklearn
+
+                if parse(sklearn.__version__) >= parse("1.3"):
+                    tdc_oracle = importlib.import_module("tdc.chem_utils.oracle.oracle")
+                    tdc_oracle.load_pickled_model = _load_legacy_sklearn_forest
             oracle = tdc.Oracle(oracle)
         elif callable(oracle):
             oracle = TempOracle(oracle)

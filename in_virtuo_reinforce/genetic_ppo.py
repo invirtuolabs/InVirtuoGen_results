@@ -1,3 +1,4 @@
+import heapq
 import json
 import os
 import traceback
@@ -6,7 +7,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import lightning
 import numpy as np
 import pandas as pd
-import copy
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -28,7 +28,7 @@ from contextlib import nullcontext
 from .pbo import BaseOptimizer
 from .utils import SoftmaxBandit, decompose_smiles, visualize_top_smiles, ExperienceReplay, GeneticPrompter, PeakSeekerBandit
 from .ga.ga import reproduce
-from .train_utils import compute_seq_logp, sample_path, filter_valid_new, custom_collate
+from .train_utils import compute_kl_divergence, compute_seq_logp, sample_path, filter_valid_new, custom_collate
 from dataclasses import asdict, dataclass
 import sascorer
 from rdkit import Chem
@@ -69,6 +69,7 @@ class OptimizerConfig:
     train_mutation: bool
     aggressive_bandit: bool
     entropy_bonus: bool
+    kl_coef: float
     # Additional configs that might be passed via *args, **kwargs
     max_oracle_calls: int
     no_sample_uni: bool
@@ -83,6 +84,104 @@ class OptimizerConfig:
     eta: float
     start_rank: int = 0
     max_frags: int = 5
+    # GA mutants proposed per round. 0 falls back to tot_offspring_size (old coupled
+    # behaviour); set it explicitly to decouple the GA quota from the reinforce batch, e.g.
+    # a large tot_offspring_size (train on many) with a small GA per round.
+    ga_offspring_size: int = 0
+    pretrained_dir: Optional[str] = None
+    save_pretrained_dir: Optional[str] = None
+    # Periodically re-save save_pretrained_dir every N oracle calls so a walltime timeout
+    # keeps the best-so-far stage 1 instead of losing it. 0 disables (final save only).
+    ckpt_every_n_calls: int = 10000
+    # Only bank a periodic checkpoint above this generation validity (percent).
+    ckpt_min_validity: float = 50.0
+    # Early stopping on the top-N average: stop once early_stop_patience_calls oracle calls
+    # have passed without an improvement greater than early_stop_min_delta. Set to 0 to
+    # disable the staleness stop; the separate "top-10 average reached 1.0" stop is
+    # unaffected and always applies during stage 1.
+    early_stop_min_delta: float = 0.01
+    early_stop_patience_calls: int = 5000
+    # Stop stage 1 once the top-10 average reaches this. Slightly below 1.0 so oracles
+    # that plateau just under the ceiling (drd2 ~0.9994, gsk3b ~0.9900) stop too instead
+    # of burning the rest of the budget. Only affects when the stage-1 ckpt is banked -
+    # the reported benchmark AUC comes from stage 2, which never early-stops.
+    early_stop_top_avg: float = 0.99
+    # Floor before any early stop may fire. Hitting the top-10 threshold says the buffer
+    # holds 10 good molecules, not that the policy has converged - measured stops at
+    # 10.4k-22.7k calls banked visibly under-trained stage-1 checkpoints.
+    early_stop_min_calls: int = 25000
+    # Diagnostic image snapshots per run (evenly spaced over the oracle budget, the last
+    # one at run end). 0 disables images entirely. wandb stores every wandb.Image forever,
+    # so this is a hard cap on a run's media footprint; local copies overwrite one path.
+    plot_times_per_run: int = 4
+    batch_size: Optional[int] = None
+    min_tanimoto_dist: float = 0.7
+    single_prompt: bool = False
+    parent_pool_size: int = 10000
+    ga_elite_parents: int = 1
+    # PeakSeekerBandit quantile step size (eta_q): how fast each arm's reward estimate
+    # tracks what it observes. Was hardcoded at the class default of 0.1.
+    bandit_lr: float = 0.3
+    # Softmax temperature over arm scores: z = (s - max(s)) / tau, so SMALLER = sharper pi.
+    # 0.3 concentrates ~0.81 of the mass within +-10 of the best arm against 0.65 at the old
+    # 0.5; going lower locks on prematurely (0.15 converged on a wrong length in testing).
+    bandit_tau: float = 0.3
+    # Uniform probability mixed into every arm regardless of score. Was hardcoded at 0.01.
+    bandit_floor: float = 0.005
+    # PPO minibatch, and the chunk construct_dataset scores in. 0 keeps the old behaviour of
+    # reusing tot_offspring_size, which is fine while that is ~100 but turns into thousands
+    # of tiny forward passes once tot_offspring_size is small.
+    ppo_batch_size: int = 0
+    # Stage 1 opens with a one-off random init pool sized as a fraction of max_oracle_calls.
+    # After that every round is offspring_size GA mutants on top of the model's own
+    # offspring, of which the best elite_frac * offspring_size are trained on - so
+    # init_random_frac is relative to the budget and elite_frac to offspring_size.
+    # init_ga_frac adds a second, GA-generated init pool; off by default because it costs a
+    # tenth of the budget without measurably improving on what the per-round GA already does.
+    init_random_frac: float = 0.1
+    init_ga_frac: float = 0.0
+    # Fraction of the random init pool kept to seed the first reinforce step. The init pool
+    # is thousands of untargeted samples, so training on all of it would drown the first
+    # update; ordinary rounds are already selective by construction and are not cut.
+    init_elite_frac: float = 0.1
+    # 1.0 = no per-round selection: every molecule a round scores is trained on. Below 1 it
+    # keeps the best elite_frac * offspring_size of the round instead.
+    elite_frac: float = 1.0
+    # eta for the random init pool only. h = min(eta*dt, 1-t), so a large eta collapses
+    # generation to a single jump to the model's x_1 prediction - cheap, high-diversity
+    # samples, which is all the init pool needs.
+    init_eta: float = 999.0
+
+
+def as_cpu_tensor(seq):
+    """
+    A 1-D CPU tensor for `seq`, whether it arrives as a list or as a tensor on the GPU.
+
+    model.sample returns device tensors; torch.tensor() on one of those silently copies to
+    the same device, so a naive conversion keeps every candidate of every round resident in
+    VRAM. Candidates are only needed on the GPU inside the reinforce step, which moves them
+    itself, so they are parked on the host in between.
+    """
+    if torch.is_tensor(seq):
+        return seq.detach().to("cpu")
+    return torch.as_tensor(seq, device="cpu")
+
+
+def safe_qed_sa(smi):
+    """
+    QED/SA for a SMILES, as (qed, sa), or (nan, nan) when RDKit cannot handle the molecule.
+
+    QED.qed re-sanitizes via Chem.RemoveHs and raises KekulizeException on molecules that
+    MolFromSmiles accepted but cannot be kekulized. These values are logging-only, so a
+    pathological mutant must not abort a run.
+    """
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return float("nan"), float("nan")
+    try:
+        return QED.qed(mol), sascorer.calculateScore(mol)
+    except Exception:
+        return float("nan"), float("nan")
 
 
 def sample_path(t, x_0, x_1, n=1):
@@ -136,21 +235,36 @@ class InVirtuoFMOptimizer(BaseOptimizer):
 
         # Initialize wandb with config
         wandb.init(project="tdc-ppo-finetune", config=asdict(self.config))
-
-        wandb.run.log_code("./")  # type: ignore[attr-defined]
         # Initialize instance variables from config
         self.device = torch.device(self.config.device)
         self.sa, self.qed, self.qed_ga, self.sa_ga, self.ga_scores, self.ga_tries = [], [], [], [], [], []
         self.global_step = 0
         self.stop_counter = 0
         self.ga_best_counter = 0
+        # Rounds in which the elite parent ran out of novel mutants and the draw widened.
+        self.ga_widen_counter = 0
         self.ga_start = 0
         # Model initialization
         ckpt = self.config.ckpt
+        pretrained = None
+        self.elite = None  # stage-1 top-K molecules by score, used to seed stage 2
+        if self.config.pretrained_dir:
+            pretrained_path = os.path.join(self.config.pretrained_dir, f"{self.config.oracle}.ckpt")
+            pretrained = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+            if pretrained["oracle"] != self.config.oracle:
+                raise ValueError(f"Pretrained checkpoint is for {pretrained['oracle']}, not {self.config.oracle}")
+            self.config.use_prompter |= pretrained.get("prompter_vocab") is not None
+            self.elite = pretrained.get("elite")
+
         self.model = InVirtuoFM.load_from_checkpoint(ckpt, map_location="cpu").to(self.device)
+        if pretrained:
+            self.model.load_state_dict(pretrained["model_state_dict"])
 
         self.prior = InVirtuoFM.load_from_checkpoint(ckpt, map_location="cpu").to(self.device)
-        self.prior.model.requires_grad = False
+        if pretrained:
+            self.prior.load_state_dict(pretrained["model_state_dict"])
+        self.prior.requires_grad_(False)
+        self.prior.eval()
         self.tokenizer = self.model.tokenizer
         loaded = torch.load("configs/zinc_dist.pt")
         self.seq_lengths = loaded["unique_lengths"]
@@ -163,7 +277,9 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             mean = 0.0
         self.bandit = SoftmaxBandit(prior_probs=self.seq_prior_probs.cpu().numpy(), lengths=self.seq_lengths, lr=self.config.lr, beta=self.config.beta, mean_reward=mean)
         if self.config.aggressive_bandit:
-            self.bandit = PeakSeekerBandit(prior_probs=self.seq_prior_probs.cpu().numpy(), lengths=self.seq_lengths, floor=0.01, w_best=0.6, w_quant=0.8, neigh_bw=3.0, ucb_c=0.1)
+            self.bandit = PeakSeekerBandit(prior_probs=self.seq_prior_probs.cpu().numpy(), lengths=self.seq_lengths, floor=self.config.bandit_floor, w_best=0.6, w_quant=0.8, neigh_bw=3.0, ucb_c=0.1, eta_q=self.config.bandit_lr, tau=self.config.bandit_tau)
+        if pretrained and pretrained.get("bandit_state"):
+            self.bandit.__dict__.update(pretrained["bandit_state"])
         if self.config.use_prompter:
             self.prompter = GeneticPrompter(
                 tokenizer=self.tokenizer,
@@ -177,11 +293,29 @@ class InVirtuoFMOptimizer(BaseOptimizer):
                 score_based=False,
                 K=1,  # if self.config.use_prescreen else 2,
                 start_rank=self.config.start_rank,
+                min_tanimoto_dist=self.config.min_tanimoto_dist,
             )
+            if pretrained:
+                self.prompter.vocab = pretrained["prompter_vocab"]
+                self.prompter.vocab_fps = pretrained["prompter_vocab_fps"]
+                top_vocab = dict(sorted(self.prompter.vocab.items(), key=lambda item: item[1], reverse=True)[: self.config.vocab_size])
+                self.prompter.vocab = top_vocab
+                self.prompter.vocab_fps = {
+                    key: value for key, value in self.prompter.vocab_fps.items() if key in top_vocab
+                }
+            self.prompter.combine_prompts = not self.config.single_prompt
 
         self.model_opt = optim.Adam(self.model.parameters(), lr=self.config.rl_lr, betas=(0.9, 0.999))
-        num_steps = int(self.config.max_oracle_calls // (self.config.tot_offspring_size)*self.config.num_reinforce_steps)
-        self.lr_scheduler = get_cosine_schedule_with_warmup(self.model_opt, num_warmup_steps=10, num_training_steps=num_steps)
+        # One reinforce call issues num_reinforce_steps optimizer steps, and a round spends
+        # model_offspring_per_round + ga_per_round oracle calls, after the init pool has
+        # taken its share. Deriving the schedule length from that keeps the cosine decay
+        # aligned however the round is split between the model and the GA.
+        calls_per_round = max(1, self.model_offspring_per_round + self.ga_per_round)
+        rounds = max(1, (self.config.max_oracle_calls - self.init_budget) // calls_per_round)
+        num_steps = max(1, rounds * self.config.num_reinforce_steps)
+        self.lr_scheduler = get_cosine_schedule_with_warmup(
+            self.model_opt, num_warmup_steps=min(10, max(1, num_steps // 10)), num_training_steps=num_steps
+        )
 
         # Initialize trainer
         trainer = Trainer(max_steps=1, limit_train_batches=0.0, logger=False)
@@ -189,6 +323,9 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         self.used_mutation = not self.config.use_mutation
         self.prev_validity = 1
         self.train_ids, self.train_prompts, self.train_scores, self.train_old_logprobs, self.train_x_0 = [], [], [], [], []
+        # (seq, x_0, score) for everything the current round scored, model offspring and GA
+        # mutants alike; drained by select_elite() at the end of the round.
+        self.round_pool = []
 
         self.config.experience_replay_size = self.config.experience_replay_size
         self.experience = ExperienceReplay(max_size=self.config.experience_replay_size , device=self.device)
@@ -204,7 +341,7 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         Also controls the stop counter.
         """
         self.global_step += 1
-        wandb.log({"train/c_neg": self.c_neg, "num_oracle_calls": len(self.mol_buffer.values())}, step=self.global_step)
+        wandb.log({"train/c_neg": self.c_neg, "num_oracle_calls": len(self.mol_buffer.values())})
         if novelty >= 0.5 * (1 - self.config.start_t):
             self.c_neg = self.config.c_neg
             self.stop_counter -= 1
@@ -217,52 +354,159 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             # self.config.c_neg *= 0.9
             self.stop_counter += 1
         self.global_step += 1
-        wandb.log({"train/c_neg": self.c_neg, "train/stop_counter": self.stop_counter, "num_oracle_calls": len(self.mol_buffer.values())}, step=self.global_step)
+        wandb.log({"train/c_neg": self.c_neg, "train/stop_counter": self.stop_counter, "num_oracle_calls": len(self.mol_buffer.values())})
+
+    @property
+    def ga_per_round(self):
+        """Mutants a single round asks the GA for. 0 when mutation is off (e.g. stage 2)."""
+        if not self.config.use_mutation:
+            return 0
+        return self.config.ga_offspring_size or self.config.tot_offspring_size
+
+    @property
+    def ppo_batch(self):
+        """Rows per PPO minibatch / per construct_dataset scoring chunk."""
+        return max(1, self.config.ppo_batch_size or self.config.tot_offspring_size or 1)
+
+    @property
+    def model_offspring_per_round(self):
+        """
+        Offspring the model itself proposes each round: the full offspring_size.
+
+        Stage 2 keeps the old tot_offspring_size cap, because it trains on everything it
+        scores (elite_frac is forced to 1.0 there), so anything beyond one reinforce batch
+        would be oracle-scored for nothing. In stage 1 the surplus is the point - it is what
+        elite selection picks from.
+        """
+        n = self.config.offspring_size
+        if self.config.pretrained_dir and self.config.tot_offspring_size:
+            n = min(n, self.config.tot_offspring_size)
+        return n
+
+    @property
+    def elite_per_round(self):
+        """
+        How many of a round's molecules reach the training set.
+
+        At elite_frac >= 1 that is the whole round; below 1 it is elite_frac * offspring_size,
+        so the cut scales with what the model proposes rather than with the pool it lands in.
+        """
+        if self.config.elite_frac >= 1.0:
+            return self.model_offspring_per_round + self.ga_per_round
+        return max(1, int(self.config.elite_frac * self.config.offspring_size))
+
+    @property
+    def reinforce_trigger(self):
+        """
+        Training set size that fires a reinforce step.
+
+        A round yields elite_per_round molecules, which is below tot_offspring_size once
+        elite_frac starts biting; gating on tot_offspring_size alone would then stall the
+        model for several rounds at a time instead of training after every round.
+        """
+        return max(1, min(self.config.tot_offspring_size, self.elite_per_round))
+
+    @property
+    def init_budget(self):
+        """Oracle calls the stage-1 init pools consume. 0 in stage 2, which seeds from the elite."""
+        if self.config.pretrained_dir:
+            return 0
+        n = max(1, int(self.config.init_random_frac * self.config.max_oracle_calls))
+        if self.config.use_mutation:
+            n += int(self.config.init_ga_frac * self.config.max_oracle_calls)
+        return n
+
+    def select_elite(self):
+        """
+        Promote the best elite_frac of this round's scored molecules into the training set.
+
+        Everything a round produces - the model's own offspring and the GA mutants - lands in
+        self.round_pool first, so selection sees the whole round and can take a true top-k
+        rather than each source deciding on its own against a stale threshold.
+        """
+        if not self.round_pool:
+            return
+        k = min(self.elite_per_round, len(self.round_pool))
+        elite = heapq.nlargest(k, self.round_pool, key=lambda item: item[2])
+        for seq, x_0, score in elite:
+            self.train_ids.append(seq)
+            self.train_scores.append(score)
+            self.train_x_0.append(x_0)
+        self.round_pool = []
 
     def run_ga(self, max_tries=10):
         """
-        Run the mol-opt molecule mutations
+        Mutate the buffer's elite with the mol-opt GA and score the mutants.
+
+        A round asks the GA for ga_per_round molecules, so the candidates are collected first
+        and handed to the oracle in one call instead of one call per mutant. The scored
+        mutants go into round_pool, where they compete with the model's own offspring for the
+        round's elite slots rather than being admitted against a threshold of their own.
+
+        Parents come from the top ga_elite_parents of the buffer - rank 1 by default, which
+        is what actually produces new global bests. Mutating only the champion eventually
+        exhausts its novel neighbourhood, though, and a round that can no longer find an
+        unseen mutant would burn its whole attempt budget issuing no oracle calls at all, so
+        a long run of rejections widens the draw to the top parent_pool_size for the rest of
+        the round.
         """
-
-
-        tries = 0
-        for iteration in range(self.config.mutation_size):
-            score = None
-            i_ = 0
-            while i_ < max_tries:
-                selected_parent = sorted(self.mol_buffer.items(), key=lambda x: x[1][0], reverse=True)[i_ : i_ + 1]
-                if sorted(self.mol_buffer.values(), key=lambda x: x[0], reverse=True)[0][0] == 0:
-                    selected_parent = [random.choice(list(self.mol_buffer.items()))]
-
-                smi, tries_temp = reproduce(selected_parent, 1)
-                try:
-                    smi = Chem.MolToSmiles(Chem.MolFromSmiles(smi))
-                except:
-                    pass
-                tries += tries_temp + i_
-                if smi and smi not in self.mol_buffer:
-                    score = self.oracle(smi)
-                    if score is not None:
-                        self.ga_scores.append(score)
-                        self.qed_ga.append(QED.qed(Chem.MolFromSmiles(smi)))
-                        self.sa_ga.append(sascorer.calculateScore(Chem.MolFromSmiles(smi)))
-                        if score > max(self.scores):
-                            self.ga_best_counter += 1
-                        new_seq = torch.tensor(self.tokenizer.encode(" ".join(decompose_smiles(smi))))
-
-                        if score > sorted(self.mol_buffer.values(), key=lambda x: x[0], reverse=True)[min(len(self.mol_buffer.values()) - 1, 9)][0] and self.config.train_mutation:
-                            self.train_ids.append(new_seq)
-                            self.train_scores.append(score)
-                            self.train_x_0.append(torch.randint(4, 203, (len(new_seq),)))
-                        if self.config.use_prompter:
-                            if score > 0:
-                                self.prompter.update_with_score(smi, score)
-                                self.prompter.bandit.update(len(new_seq[new_seq != self.model.pad_token_id]), score)
-                        break
-                i_ += 1
-            if len(self.ga_scores[self.ga_start:]) >= self.config.mutation_size  or len(self.train_ids) >= self.config.tot_offspring_size:
-                break
         self.used_mutation = True
+        # Never mutate past the budget: score_smi silently returns 0 once the buffer is full,
+        # which would look like a round of worthless molecules.
+        quota = min(self.ga_per_round, max(0, self.config.max_oracle_calls - len(self.mol_buffer)))
+        if quota <= 0:
+            return
+        # One nlargest pass per round, rather than the three full-buffer sorts that used to
+        # sit inside the retry loop (O(n log n) on up to 100k entries, once per mutation).
+        elite_pool = heapq.nlargest(
+            max(1, self.config.ga_elite_parents), self.mol_buffer.items(), key=lambda x: x[1][0]
+        )
+        if not elite_pool:
+            return
+        parent_pool, widened = elite_pool, False
+        stall_limit = max_tries * 10
+
+        ga_smiles, seen, tries, stall = [], set(), 0, 0
+        max_attempts = quota * max_tries
+        while len(ga_smiles) < quota and tries < max_attempts:
+            tries += 1
+            smi, tries_temp = reproduce([random.choice(parent_pool)], 1)
+            tries += tries_temp
+            mol = Chem.MolFromSmiles(smi) if smi else None
+            smi = Chem.MolToSmiles(mol) if mol is not None else None
+            if smi is None or smi in seen or smi in self.mol_buffer:
+                stall += 1
+                if not widened and stall >= stall_limit:
+                    parent_pool = heapq.nlargest(
+                        max(self.config.parent_pool_size, 10), self.mol_buffer.items(), key=lambda x: x[1][0]
+                    )
+                    widened = True
+                continue
+            stall = 0
+            seen.add(smi)
+            ga_smiles.append(smi)
+        if widened:
+            self.ga_widen_counter += 1
+        if not ga_smiles:
+            return
+
+        ga_scores = self.oracle(ga_smiles)
+        best_so_far = max(self.scores) if self.scores else 0
+        for smi, score in zip(ga_smiles, ga_scores):
+            if score is None:
+                continue
+            self.ga_scores.append(score)
+            qed_ga_, sa_ga_ = safe_qed_sa(smi)
+            self.qed_ga.append(qed_ga_)
+            self.sa_ga.append(sa_ga_)
+            if score > best_so_far:
+                self.ga_best_counter += 1
+            new_seq = torch.tensor(self.tokenizer.encode(" ".join(decompose_smiles(smi))))
+            if self.config.train_mutation:
+                self.round_pool.append((new_seq, torch.randint(4, 203, (len(new_seq),)), score))
+            if self.config.use_prompter and score > 0:
+                self.prompter.update_with_score(smi, score)
+                self.prompter.bandit.update(len(new_seq[new_seq != self.model.pad_token_id]), score)
 
         if len(self.ga_scores[self.ga_start:]) > 0:
             self.global_step += 1
@@ -272,11 +516,11 @@ class InVirtuoFMOptimizer(BaseOptimizer):
                     "ga/best_ga_scores": np.max(self.ga_scores[self.ga_start:]),
                     "num_oracle_calls": len(self.mol_buffer.values()),
                     "ga/tries": tries / max_tries,
-                    "ga/qed": np.mean(self.qed_ga[self.ga_start:]),
-                    "ga/sa": np.mean(self.sa_ga[self.ga_start:]),
+                    "ga/qed": np.nanmean(self.qed_ga[self.ga_start:]),
+                    "ga/sa": np.nanmean(self.sa_ga[self.ga_start:]),
                     "ga/best_ga_counter": self.ga_best_counter,
+                    "ga/widen_counter": self.ga_widen_counter,
                 },
-                step=self.global_step,
             )
             self.ga_start = len(self.ga_scores)
 
@@ -286,8 +530,6 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         Evaluate the offspring sequences.
         """
         for i, (seq, x_0, smi) in enumerate(zip(valid_new_seqs, valid_new_x_0, valid_new_smiles)):
-            if len(self.train_ids) >= self.config.tot_offspring_size - self.config.mutation_size * (not self.used_mutation and self.config.train_mutation):
-                break
             if self.config.classic_ga:
                 counter = 0
                 while counter<10:
@@ -300,9 +542,12 @@ class InVirtuoFMOptimizer(BaseOptimizer):
                 if counter == 10:
                     continue
 
-            seq = torch.tensor(seq)
-            qed = QED.qed(Chem.MolFromSmiles(smi))
-            sa = sascorer.calculateScore(Chem.MolFromSmiles(smi))
+            # Hold candidates on the CPU. These come straight off model.sample, so keeping
+            # them as GPU tensors pins a whole round's worth of sequences in VRAM alongside
+            # the model; construct_dataset moves them back for the reinforce step anyway.
+            seq = as_cpu_tensor(seq)
+            x_0 = as_cpu_tensor(x_0)
+            qed, sa = safe_qed_sa(smi)
             self.qed.append(qed)
             self.sa.append(sa)
             score = self.oracle(smi)
@@ -317,9 +562,7 @@ class InVirtuoFMOptimizer(BaseOptimizer):
                 else:
                     self.bandit.update(len(seq[seq != self.model.pad_token_id]), score)
 
-            self.train_ids.append(seq)
-            self.train_scores.append(score)  # *qed if (qed>0.8 and sa<3) else score*(qed*0.5)*(min(0,4-sa))
-            self.train_x_0.append(x_0)
+            self.round_pool.append((seq, x_0, score))
 
         return
 
@@ -349,13 +592,27 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         scores_tensor = torch.tensor(scores, device=self.device)
         old_logprobs, x_ts_list, source_masks_list, t_list = [], [], [], []
         t_roll = torch.rand(len(ids_tensor), device=self.device)
+        # Score the training set in chunks of tot_offspring_size. compute_logprobs holds
+        # [B, L, L] attention masks and a [B, L, V] softmax, so running it over the whole
+        # set at once made peak memory scale with the training set - which elite selection
+        # can now make an order of magnitude larger than the reinforce batch.
+        chunk = self.ppo_batch
         for i in range(timesteps):
             current_t = (t_roll / 10 + i * (1.0 - self.config.start_t) / timesteps) % 1
             current_t = current_t.clamp(0, 0.99)
-            old_lp, _, x_t, source_mask = self.compute_logprobs(ids_tensor, uni_tensor, current_t, prior=True)
-            old_logprobs.append(old_lp.detach().unsqueeze(1))
-            x_ts_list.append(x_t.unsqueeze(1).clone())
-            source_masks_list.append(source_mask.unsqueeze(1).clone().to(self.device))
+            lp_parts, x_t_parts, mask_parts = [], [], []
+            for s in range(0, len(ids_tensor), chunk):
+                e = min(s + chunk, len(ids_tensor))
+                with torch.no_grad():
+                    old_lp, _, x_t, source_mask, _ = self.compute_logprobs(
+                        ids_tensor[s:e], uni_tensor[s:e], current_t[s:e]
+                    )
+                lp_parts.append(old_lp.detach())
+                x_t_parts.append(x_t)
+                mask_parts.append(source_mask)
+            old_logprobs.append(torch.cat(lp_parts, dim=0).unsqueeze(1))
+            x_ts_list.append(torch.cat(x_t_parts, dim=0).unsqueeze(1).clone())
+            source_masks_list.append(torch.cat(mask_parts, dim=0).unsqueeze(1).clone().to(self.device))
             t_list.append(current_t)
         ids_tensor = ids_tensor.repeat(timesteps, 1)
         scores_tensor = scores_tensor.repeat(timesteps)
@@ -379,7 +636,7 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             ids, scores, uni = map(list, zip(*combined))
         combined_dataset = self.construct_dataset(ids, scores, uni, self.config.num_timesteps)
         loader = DataLoader(
-            combined_dataset, batch_size=(self.config.tot_offspring_size), shuffle=True, collate_fn=custom_collate, drop_last=False
+            combined_dataset, batch_size=self.ppo_batch, shuffle=True, collate_fn=custom_collate, drop_last=False
         )
         return loader
 
@@ -408,7 +665,7 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         mask_sum = source_mask.float().sum(dim=-1)
         seq_entropy = step_entropy.sum(dim=1) / torch.clamp(mask_sum, min=1.0)
 
-        return logprobs_, seq_entropy, x_t, source_mask
+        return logprobs_, seq_entropy, x_t, source_mask, logits
 
     def reinforce(self, ids, scores, uni):
         """PPO-style reinforce with (optional) experience replay."""
@@ -417,12 +674,45 @@ class InVirtuoFMOptimizer(BaseOptimizer):
 
         loader = self.construct_loader(ids, scores, uni)
 
+        # reinforce/reward below is a single minibatch's mean, sampled from a shuffled loader,
+        # so it is dominated by sampling noise. Log the round's whole elite set too, which is
+        # the quantity that actually says whether training data is improving.
+        if scores:
+            self.global_step += 1
+            wandb.log(
+                {
+                    "reinforce/elite_reward_mean": float(np.mean(scores)),
+                    "reinforce/elite_reward_min": float(np.min(scores)),
+                    "reinforce/elite_reward_max": float(np.max(scores)),
+                    "reinforce/num_batches": len(loader),
+                    "num_oracle_calls": len(self.mol_buffer.values()),
+                },
+            )
+
         num_batches = len(loader)
         self.model_opt.zero_grad()
         avg_grad_norm = 0
+        # Averaged over every minibatch that contributed gradients to the coming optimizer
+        # step. Reporting a single minibatch instead made these dominated by shuffling noise:
+        # one batch is 100 of num_batches*100 rows, so reinforce/reward swung ~0.06
+        # peak-to-peak on a training set whose true mean was not moving at all.
+        acc = dict.fromkeys(("loss", "pg_loss", "kl_div", "ratio", "reward", "adv", "entropy"), 0.0)
+        acc_n = 0
+        log_every = max(1, len(loader) // self.config.num_reinforce_steps)
         for i, (batch_ids, batch_scores, batch_uni, batch_t, batch_old_lp, batch_x_ts, batch_masks) in enumerate(loader):
 
-            agent_lp, entropy, _, _ = self.compute_logprobs(batch_ids, batch_uni, batch_t, prior=False, x_t=batch_x_ts, source_mask=batch_masks)
+            agent_lp, entropy, _, _, agent_logits = self.compute_logprobs(
+                batch_ids, batch_uni, batch_t, x_t=batch_x_ts, source_mask=batch_masks
+            )
+            if self.config.kl_coef > 0:
+                _, _, _, _, reference_logits = self.compute_logprobs(
+                    batch_ids, batch_uni, batch_t, prior=True, x_t=batch_x_ts, source_mask=batch_masks
+                )
+                kl_div = compute_kl_divergence(
+                    agent_logits, reference_logits, batch_masks, reverse=self.config.reverse_kl
+                )
+            else:
+                kl_div = agent_logits.new_zeros(())
             ratio = torch.exp((agent_lp - batch_old_lp))
             score_std = batch_scores.std()
             if batch_scores.numel() > 1 and not score_std < 1e-8:
@@ -436,9 +726,9 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             pg_loss = -torch.min(surr1, surr2).mean()
               # - 0.01 * entropy.mean()
             if self.config.entropy_bonus:
-                loss =  pg_loss / num_batches - 0.01 * entropy.mean()/num_batches
+                loss = (pg_loss + self.config.kl_coef * kl_div - 0.01 * entropy.mean()) / num_batches
             else:
-                loss = pg_loss / num_batches
+                loss = (pg_loss + self.config.kl_coef * kl_div) / num_batches
             if torch.isnan(loss) or torch.isinf(loss):
                 print("loss is nan or inf")
                 continue
@@ -448,23 +738,36 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             avg_grad_norm += grad_norm
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2)
 
-            if i % max(1, len(loader)//self.config.num_reinforce_steps) == max(1, len(loader)//self.config.num_reinforce_steps) - 1:
-                self.global_step += 1
+            acc["loss"] += loss.item()
+            acc["pg_loss"] += pg_loss.item()
+            acc["kl_div"] += kl_div.item()
+            acc["ratio"] += ratio.mean().item()
+            acc["reward"] += batch_scores.mean().item()
+            acc["adv"] += adv.mean().item()
+            acc["entropy"] += entropy.mean().item()
+            acc_n += 1
 
-                wandb.log(
-                {
-                    "reinforce/loss": loss.item(),
-                    "reinforce/pg_loss": pg_loss.item(),
-                    "reinforce/ratio": ratio.mean().item(),
-                    "reinforce/reward": batch_scores.mean().item(),
-                    "reinforce/adv": adv.mean().item(),
-                    "reinforce/grad_norm": torch.cat([p.grad.flatten() for p in self.model.parameters() if p.grad is not None]).norm().item(),
-                    "lr": self.lr_scheduler.get_last_lr()[0],
-                    "reinforce/entropy": entropy.mean().item(),
-                    "num_oracle_calls": len(self.mol_buffer.values()),
-                },
-                step=self.global_step,
-            )
+            if i % log_every == log_every - 1:
+                if acc_n:
+                    self.global_step += 1
+                    wandb.log(
+                        {
+                            "reinforce/loss": acc["loss"] / acc_n,
+                            "reinforce/pg_loss": acc["pg_loss"] / acc_n,
+                            "reinforce/kl_div": acc["kl_div"] / acc_n,
+                            "reinforce/ratio": acc["ratio"] / acc_n,
+                            "reinforce/reward": acc["reward"] / acc_n,
+                            "reinforce/adv": acc["adv"] / acc_n,
+                            # Norm of the accumulated gradient at the step, not a batch mean.
+                            "reinforce/grad_norm": grad_norm,
+                            "reinforce/batches_in_step": acc_n,
+                            "lr": self.lr_scheduler.get_last_lr()[0],
+                            "reinforce/entropy": acc["entropy"] / acc_n,
+                            "num_oracle_calls": len(self.mol_buffer.values()),
+                        },
+                    )
+                    acc = dict.fromkeys(acc, 0.0)
+                    acc_n = 0
                 self.lr_scheduler.step()
                 self.model_opt.step()
                 self.model_opt.zero_grad()
@@ -477,33 +780,133 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         Returns:
             List of (sequence, score, smile) triples
         """
-        B = int(self.config.first_pop_size * 1.1)  # generate more samples to ensure we have enough valid ones
+        if self.config.pretrained_dir:
+            # stage 2: do not reinitialize by random sampling — seed the population from
+            # stage 1's best. Prefer the saved elite (actual top-K by score); fall back to
+            # the diversity-deduplicated prompter vocab for older checkpoints without one.
+            k = self.config.first_pop_size
+            if self.elite:
+                smiles = [smi for smi, _ in self.elite[:k]]
+                samples = [torch.tensor(self.tokenizer.encode(" ".join(decompose_smiles(smi, max_frags=self.config.max_frags)))) for smi in smiles]
+            else:
+                vocab_items = sorted(self.prompter.vocab.items(), key=lambda kv: kv[1], reverse=True)[: self.config.vocab_size]
+                samples = [torch.tensor(list(kk)) for kk, _ in vocab_items]
+                smiles = [bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, list(s)).split(" ")) for s in samples]
+            init_ids = [torch.randint(4, 203, (len(s),)) for s in samples]
+            scores = self.oracle(smiles)
+        else:
+            # stage 1: spend init_random_frac of the oracle budget on a random pool and
+            # init_ga_frac on GA mutants of its best, update the prompter with ALL of them,
+            # then keep only the best tot_offspring_size to seed the first reinforce step.
+            n_random = max(1, int(self.config.init_random_frac * self.config.max_oracle_calls))
+            n_ga_init = int(self.config.init_ga_frac * self.config.max_oracle_calls)
+            gen_bs = self.config.batch_size or self.config.offspring_size * 2
+            pool_samples, pool_init_ids, pool_smiles = [], [], []
+            remaining = n_random
+            while remaining > 0:
+                b = min(gen_bs, remaining)
+                n_oracle = [self.bandit.select_length() for _ in range(b)]
+                gen_seqs, gen_x0 = self.model.sample(
+                    num_samples=b,
+                    temperature=1.0,
+                    noise=1.0,
+                    oracle=n_oracle,
+                    # init_eta, not the run's eta: h = min(eta*dt, 1-t) saturates, so this is
+                    # a single jump to the model's x_1 prediction instead of a 1/dt-step
+                    # trajectory. The init pool wants breadth cheaply, not refined samples.
+                    eta=self.config.init_eta,
+                    return_uni=True,
+                )
+                valid, gen_smiles, _ = evaluate_smiles(
+                    generated_ids=gen_seqs,
+                    tokenizer=self.tokenizer,
+                    return_values=True,
+                    print_flag=False,
+                    print_metrics=False,
+                    exclude_salts=False,
+                )
+                # Park the pool on the host: at init_random_frac of a 100k budget this is
+                # ~10k sequences, which have no reason to sit in VRAM next to the model.
+                pool_samples += [as_cpu_tensor(gen_seqs[i]) for i in valid]
+                pool_init_ids += [as_cpu_tensor(gen_x0[i]) for i in valid]
+                pool_smiles += [gen_smiles[i] for i in valid]
+                remaining -= b
+                del gen_seqs, gen_x0
+            if not pool_samples:
+                raise RuntimeError("Could not generate a valid initial molecule in the init pool")
+            pool_scores = list(self.oracle(pool_smiles))
+            first_pos_src = None
+            if pool_scores and max(pool_scores) > 0:
+                i = next(i for i, s in enumerate(pool_scores) if s > 0)
+                first_pos_src = "init_denovo"
+                print(f"first score>0 from {first_pos_src} at oracle_call~{i+1}: "
+                      f"score={pool_scores[i]:.4f} smi={pool_smiles[i]}")
 
-        n_oracle = [self.bandit.select_length() for _ in range(int(B))]  #
+            # Mutate top-of-pool into the init pool. Scores may all be 0 (valsartan); reproduce
+            # still crosses/mutates parents — equal fitness just makes parent pick uniform.
+            def _ga_into_pool(target, source_label):
+                nonlocal first_pos_src
+                if not self.config.use_mutation or target <= 0 or not pool_smiles:
+                    return
+                # Wider than elite top-1: fitness-sample parents from top parent_pool_size
+                # (uniform when scores are tied / all-zero).
+                n_parents = min(len(pool_smiles), max(1, self.config.parent_pool_size))
+                top_pool = sorted(zip(pool_smiles, pool_scores), key=lambda x: x[1], reverse=True)[:n_parents]
+                population = [(smi, [sc]) for smi, sc in top_pool]
+                seen = set(pool_smiles)
+                mut_smiles, attempts = [], 0
+                while len(mut_smiles) < target and attempts < target * 5:
+                    attempts += 1
+                    smi, _ = reproduce(population, 1)
+                    if not smi:
+                        continue
+                    m = Chem.MolFromSmiles(smi)
+                    if m is None:
+                        continue
+                    smi = Chem.MolToSmiles(m)
+                    if smi in seen:
+                        continue
+                    seen.add(smi)
+                    mut_smiles.append(smi)
+                if not mut_smiles:
+                    return
+                mut_scores = list(self.oracle(mut_smiles))
+                mut_samples = [
+                    torch.tensor(self.tokenizer.encode(" ".join(decompose_smiles(s, max_frags=self.config.max_frags))))
+                    for s in mut_smiles
+                ]
+                pool_samples.extend(mut_samples)
+                pool_init_ids.extend(torch.randint(4, 203, (len(s),)) for s in mut_samples)
+                pool_smiles.extend(mut_smiles)
+                pool_scores.extend(mut_scores)
+                if first_pos_src is None and any(s > 0 for s in mut_scores):
+                    i = next(i for i, s in enumerate(mut_scores) if s > 0)
+                    first_pos_src = source_label
+                    print(f"first score>0 from {first_pos_src} at buffer={len(self.oracle)}: "
+                          f"score={mut_scores[i]:.4f} smi={mut_smiles[i]}")
 
-        samples, init_ids = self.model.sample(
-            num_samples=B,
-            temperature=1.0,
-            noise=1.0,
-            oracle=n_oracle,
-            eta=self.config.eta,
-            return_uni=True,
-        )
-        valid, smiles, _ = evaluate_smiles(
-            generated_ids=samples,
-            tokenizer=self.tokenizer,
-            return_values=True,
-            print_flag=False,
-            print_metrics=False,
-            exclude_salts=False,
-        )
+            # No positive-seed trap: if the init pool is all-zero (valsartan), leave init and
+            # let the main loop find the first hit — same as the last committed code / working
+            # v5 seed0 (first >0 ~oracle call 93k via per-round GA + eta). Prompter only
+            # engages in generate_offspring_batch once max(scores) > 0; it cannot help before
+            # that because update_with_score is gated on score > 0.
+            # also mutate: produce n_ga_init molecules via GA mutation of the best of the
+            # generated pool, score them, and fold them into the init pool.
+            _ga_into_pool(n_ga_init, "init_ga")
 
-        # keep only the valid ones
-        samples = [torch.tensor(samples[i]) for i in valid][: self.config.first_pop_size]
-        init_ids = [torch.tensor(init_ids[i]) for i in valid][: self.config.first_pop_size]
-        n_oracle = [n_oracle[i] for i in valid][: self.config.first_pop_size]
-        smiles = [smiles[i] for i in valid][: self.config.first_pop_size]
-        scores = self.oracle(smiles)
+            # update the prompter with ALL generated molecules
+            if self.config.use_prompter:
+                for smi_i, sc_i in zip(pool_smiles, pool_scores):
+                    if sc_i > 0:
+                        self.prompter.update_with_score(smi_i, sc_i)
+
+            # keep only the best init_elite_frac of the pool to train on
+            k = max(1, int(self.config.init_elite_frac * len(pool_scores)))
+            order = sorted(range(len(pool_scores)), key=lambda i: pool_scores[i], reverse=True)[:k]
+            samples = [pool_samples[i] for i in order]
+            init_ids = [pool_init_ids[i] for i in order]
+            smiles = [pool_smiles[i] for i in order]
+            scores = [pool_scores[i] for i in order]
 
         if self.config.use_prescreen:
             # 1. Load ZINC SMILES
@@ -517,8 +920,9 @@ class InVirtuoFMOptimizer(BaseOptimizer):
             assert len(samples) == len(smiles)
             init_ids = [torch.randint(4, 203, (len(s),)) for s in samples] + init_ids
         self.scores.extend(scores)
-        self.qed.extend([QED.qed(Chem.MolFromSmiles(smi)) for smi in smiles])
-        self.sa.extend([sascorer.calculateScore(Chem.MolFromSmiles(smi)) for smi in smiles])
+        qed_sa = [safe_qed_sa(smi) for smi in smiles]
+        self.qed.extend([q for q, _ in qed_sa])
+        self.sa.extend([s for _, s in qed_sa])
 
         for i in range(len(samples)):
             if scores[i] > 0:
@@ -532,15 +936,14 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         self.train_ids  = [s[s != self.model.pad_token_id] for s in samples]
         self.train_x_0 = [i[: len(s)] for i, s in zip(init_ids, self.train_ids)]
         self.train_scores = scores
-        if max(self.train_scores) > 0  and self.config.num_timesteps > 0:
+        if self.train_scores and max(self.train_scores) > 0 and self.config.num_timesteps > 0:
             self.reinforce([item for item in self.train_ids], [item for item in self.train_scores], [item for item in self.train_x_0])
             self.add_experience()
-        self.prior.model = copy.deepcopy(self.model.model)
         self.train_ids, self.train_scores, self.train_x_0 = [], [], []
 
     def generate_offspring_batch(self):
         n_oracle = []
-        num_samples = int(min(200, int((self.config.offspring_size) // max(0.5, self.prev_novelty))) * 1.1)
+        num_samples = self.model_offspring_per_round
         if self.config.use_prompter and max(self.scores) > 0:
             self.prompter.offspring_size = num_samples
             prompts, n_oracle = self.prompter.build_prompts_and_masks(dev=self.device)
@@ -571,11 +974,21 @@ class InVirtuoFMOptimizer(BaseOptimizer):
         n_valid = n_valid
         self.prev_validity = metrics["validity"]
 
+        self.evaluate_offspring(valid_new_seqs, valid_new_x_0, valid_new_smiles, n_valid)
+        if not self.used_mutation and not self.config.classic_ga:
+            self.run_ga()
+        # Both sources have reported in; now take the round's top elite_frac.
+        round_pool_size = len(self.round_pool)
+        self.select_elite()
+
+        # Logged after selection, not before: the previous round's reinforce step drains
+        # train_ids, so reading it at the top of a round reports 0 every time.
         self.global_step += 1
         wandb.log(
             {
                 "control/num_samples": num_samples,
                 "control/lenght_train_ids": len(self.train_ids),
+                "control/round_pool": round_pool_size,
                 "control/length": len(all_seqs),
                 "control/sum_valid_new": len(valid_new_seqs),
                 "control/num_prompts": len(prompts) if prompts is not None else 0,
@@ -588,33 +1001,31 @@ class InVirtuoFMOptimizer(BaseOptimizer):
                 "smiles/sa": metrics["sa"],
                 "num_oracle_calls": len(self.mol_buffer.values()),
             },
-            step=self.global_step,
         )
-        self.evaluate_offspring(valid_new_seqs, valid_new_x_0, valid_new_smiles, n_valid)
-        if not self.used_mutation and not self.config.classic_ga:
-            self.run_ga()
         self.set_c_neg(novelty)
 
     def evolve_population(self):
         self.generate_offspring_batch()
-        if len(self.train_ids) >= self.config.tot_offspring_size and self.config.num_timesteps > 0:
+        if len(self.train_ids) >= self.reinforce_trigger:
+            # Re-arm the GA whenever a round completes, not only when reinforce runs.
+            # run_ga() disarms itself on entry, so gating this on max(train_scores) > 0 meant
+            # an all-zero oracle (valsartan_smarts) called the GA once in round 1 and never
+            # again - measured: 50 GA molecules over a 100k-call run, vs ~2400-2900 for
+            # oracles that score. That killed the very escape hatch the init-pool comment
+            # above relies on to find the first hit.
             self.used_mutation = not self.config.use_mutation
-            self.reinforce([item for item in self.train_ids], [item for item in self.train_scores], [item for item in self.train_x_0])  # type: ignore[attr-defined]
-
-
-            self.prior.model = copy.deepcopy(self.model.model)
-            self.add_experience()
-            self.train_ids, self.train_scores, self.train_x_0 = [], [], []
-
-        elif len(self.train_ids) >= self.config.tot_offspring_size:
-            print("resetting train_ids, train_scores, train_x_0")
+            if self.config.num_timesteps > 0 and max(self.train_scores) > 0:
+                self.reinforce([item for item in self.train_ids], [item for item in self.train_scores], [item for item in self.train_x_0])  # type: ignore[attr-defined]
+                self.add_experience()
+            else:
+                print("resetting train_ids, train_scores, train_x_0")
             self.train_ids, self.train_scores, self.train_x_0 = [], [], []
 
         best_score = sorted(self.mol_buffer.values(), key=lambda x: x[0], reverse=True)[0][0]
 
         self.global_step += 1
 
-        wandb.log({"best_score": best_score, "num_oracle_calls": len(self.mol_buffer.values())}, step=self.global_step)
+        wandb.log({"best_score": best_score, "num_oracle_calls": len(self.mol_buffer.values())})
 
     def _optimize(self, oracle, config):
         """
@@ -622,46 +1033,152 @@ class InVirtuoFMOptimizer(BaseOptimizer):
           - batch_size: how many candidates to propose per oracle call
         """
         self.oracle.assign_evaluator(oracle)
-        self.model.gen_batch_size = self.config.offspring_size * 2
+        self.model.gen_batch_size = self.config.batch_size or self.config.offspring_size * 2
         print("Initializing population...")
         self.initialize_population()
+        # Stage 2 (eval) never early-stops. Its AUC is the reported benchmark number and is
+        # defined over the full oracle budget, so cutting the run short would freeze the
+        # curve at whatever it had reached. Stage 1 only feeds a checkpoint into stage 2,
+        # so ending it once the top-10 average has gone flat costs nothing.
+        early_stop_enabled = not self.config.pretrained_dir
+        stopping_top_n = 10
+        # valsartan_smarts used to be exempted from avg-based stopping ("it caps out at low
+        # scores"), which is why it burned the full budget sitting flat at ~0.95 for 60k+
+        # calls. The exemption is unnecessary: the `max(stopping_top) <= 0` guard below
+        # already keeps an all-zero oracle alive, which was the real concern.
+        initial_top = sorted((score[0] for score in self.mol_buffer.values()), reverse=True)[:stopping_top_n]
+        best_top_avg = sum(initial_top) / len(initial_top)
+        # Patience is measured in oracle calls, not rounds: rounds vary in size, so a call
+        # budget is what actually bounds the wasted work.
+        best_top_avg_at = len(self.mol_buffer)
+        next_ckpt_at = self.config.ckpt_every_n_calls
+        n_plots = max(0, self.config.plot_times_per_run)
+        plot_interval = self.config.max_oracle_calls // n_plots if n_plots else 0
+        # k=1..N-1 land in the loop; k=N is the post-loop snapshot below.
+        next_plot_at = plot_interval if n_plots > 1 else 0
         while not self.finish:
             self.evolve_population()
-            if (sum([x[0] for x in sorted(list(self.mol_buffer.values()), reverse=True)[:10]]) >= 9.99) or self.stop_counter == 10:
-
-                print("STOPPING")
-                for i in range(self.max_oracle_calls - len(self.mol_buffer)):
-                    self.mol_buffer["finished" + str(i)] = [0, len(self.mol_buffer) + i]
-
-            if len(self.mol_buffer) > 0:
-                smis_, true_scores_ = [], []
-                for smi, score in list(self.mol_buffer.items()):
-                    smis_.append(smi)
-                    true_scores_.append(score[0])
-                self.global_step += 1
-                visualize_top_smiles(smis_, scores=true_scores_, target=self.config.target, oracle_name=self.config.oracle, device=self.device)  # type: ignore[attr-defined]
-                if self.config.use_prompter:
-                    sorted_vocab = sorted(self.prompter.vocab.items(), key=lambda x: x[1], reverse=True)[:10]
-                    smiles = [bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, list(x[0])).split(" ")) for x in sorted_vocab]
-                    scores = [x[1] for x in sorted_vocab]
-                    visualize_top_smiles(smiles, scores=scores, target=self.config.target, oracle_name=self.config.oracle, device=self.device, prefix="vocab")
-                if not self.config.use_prompter:
-                    bandit = self.bandit
+            # Bank stage 1 mid-flight so a walltime timeout is not a total loss. Skipped
+            # once validity collapses (valsartan_smarts drops to ~5%): a checkpoint of a
+            # degenerate policy is worse for stage 2 than the last healthy one.
+            if next_ckpt_at and len(self.mol_buffer) >= next_ckpt_at:
+                next_ckpt_at = len(self.mol_buffer) + self.config.ckpt_every_n_calls
+                if self.prev_validity > self.config.ckpt_min_validity:
+                    self.save_pretrained_ckpt()
                 else:
-                    bandit = self.prompter.bandit
-                bandit.plot_distribution(save_path=f"plots/tdc/{self.config.oracle}/length_bandit_{self.device}.png", log_wandb=True, global_step=self.global_step, smiles_list=smis_)
+                    print(f"Skipping periodic checkpoint: validity {self.prev_validity:.1f}% <= {self.config.ckpt_min_validity}%")
+            if early_stop_enabled:
+                stopping_top = sorted((score[0] for score in self.mol_buffer.values()), reverse=True)[:stopping_top_n]
+                stopping_avg = sum(stopping_top) / len(stopping_top)
+                calls = len(self.mol_buffer)
+                # Below the floor the improvement tracking below still runs - only the exits
+                # are held back - so the staleness clock cannot bank 25k stale calls and fire
+                # the instant the floor is crossed.
+                may_stop = calls >= self.config.early_stop_min_calls
+                if may_stop and len(stopping_top) >= 10 and stopping_avg >= self.config.early_stop_top_avg:
+                    print(f"Early stopping: top-10 average reached {stopping_avg:.4f} (>= {self.config.early_stop_top_avg})")
+                    break
+                # An all-zero oracle has nothing to improve on yet, so it must never be
+                # stopped for staleness - that is the valsartan pre-first-hit regime, where
+                # the run is still searching. Keep the reference point moving with it.
+                if max(stopping_top) <= 0:
+                    best_top_avg_at = calls
+                elif stopping_avg > best_top_avg + self.config.early_stop_min_delta:
+                    best_top_avg = stopping_avg
+                    best_top_avg_at = calls
+                stale_calls = calls - best_top_avg_at
+                # patience <= 0 disables the staleness stop entirely. The `reached 1.0`
+                # stop above stays live either way: a saturated top-10 cannot improve, so
+                # ending there costs no AUC, while stopping on staleness demonstrably did.
+                if (
+                    may_stop
+                    and self.config.early_stop_patience_calls > 0
+                    and max(stopping_top) > 0
+                    and stale_calls >= self.config.early_stop_patience_calls
+                ):
+                    print(
+                        f"Early stopping: top-{stopping_top_n} average did not improve by "
+                        f">{self.config.early_stop_min_delta} over {stale_calls} oracle calls "
+                        f"({best_top_avg:.4f})"
+                    )
+                    break
 
-                try:
-                    self.global_step += 1
-                    wandb.log({"train/auc": wandb.Image("plots/tdc/" + self.config.oracle + "/tdc_avg_top10" + str(self.device) + ".png")}, step=self.global_step)
-                except:
-                    traceback.print_exc()
-                    print("wandb error")
+            # Diagnostic plots at fixed fractions of the oracle budget. wandb stores every
+            # wandb.Image forever (verified: summary assignment and repeated log() both keep
+            # one file per call, and identical content is not deduped), so the only lever is
+            # calling it less. The loop fires at k/N of the budget for k < N; the final
+            # snapshot is logged once after the loop, giving exactly N per completed run.
+            if next_plot_at and len(self.mol_buffer) >= next_plot_at:
+                next_plot_at += plot_interval
+                if next_plot_at >= self.config.max_oracle_calls:
+                    next_plot_at = 0  # the remaining slot belongs to the post-loop snapshot
+                self.log_diagnostic_plots()
         # final logging & save
         self.log_intermediate(finish=True)
+        # The Nth (and, for an early-stopped run, possibly only) plot snapshot: the state
+        # the run actually ended in, which is the one worth having on the run page.
+        self.log_diagnostic_plots()
         self.save_result_tot(self.config.oracle)
         self.save_qed_sa(self.config.oracle)
+        self.save_pretrained_ckpt()
         wandb.finish()
+
+    def log_diagnostic_plots(self):
+        """Render the top-molecule, vocab and length-bandit plots and log them to wandb.
+
+        Deliberately does NOT log the AUC curve image: that metric is already in the wandb
+        history as a scalar, so the rendered PNG was pure duplicate storage.
+        """
+        if not self.config.plot_times_per_run or not self.mol_buffer:
+            return
+        smis_, true_scores_ = [], []
+        for smi, score in list(self.mol_buffer.items()):
+            smis_.append(smi)
+            true_scores_.append(score[0])
+        self.global_step += 1
+        try:
+            visualize_top_smiles(smis_, scores=true_scores_, target=self.config.target, oracle_name=self.config.oracle, device=self.device)  # type: ignore[attr-defined]
+            if self.config.use_prompter:
+                sorted_vocab = sorted(self.prompter.vocab.items(), key=lambda x: x[1], reverse=True)[:10]
+                smiles = [bridge_smiles_fragments(custom_decode_sequence(self.tokenizer, list(x[0])).split(" ")) for x in sorted_vocab]
+                scores = [x[1] for x in sorted_vocab]
+                visualize_top_smiles(smiles, scores=scores, target=self.config.target, oracle_name=self.config.oracle, device=self.device, prefix="vocab")
+            bandit = self.prompter.bandit if self.config.use_prompter else self.bandit
+            bandit.plot_distribution(save_path=f"plots/tdc/{self.config.oracle}/length_bandit_{self.device}.png", log_wandb=True, global_step=self.global_step, smiles_list=smis_)
+        except Exception:
+            traceback.print_exc()
+            print("wandb error")
+
+    def save_pretrained_ckpt(self):
+        """Bank the stage-1 checkpoint stage 2 loads from.
+
+        Written atomically (tmp + replace) because the periodic caller can be killed
+        mid-write by a walltime timeout, which is the exact case it exists to survive.
+        """
+        if not self.config.save_pretrained_dir:
+            return
+        os.makedirs(self.config.save_pretrained_dir, exist_ok=True)
+        pretrained_path = os.path.join(self.config.save_pretrained_dir, f"{self.config.oracle}.ckpt")
+        bandit = self.prompter.bandit if self.config.use_prompter else self.bandit
+        # elite = the actual top-K molecules by raw oracle score (no diversity filter),
+        # so stage 2 can seed its population from stage 1's best instead of the
+        # diversity-deduplicated prompter vocab.
+        elite = sorted(self.mol_buffer.items(), key=lambda kv: kv[1][0], reverse=True)[:100]
+        elite = [(smi, float(v[0])) for smi, v in elite]
+        tmp_path = pretrained_path + ".tmp"
+        torch.save(
+            {
+                "oracle": self.config.oracle,
+                "model_state_dict": self.model.state_dict(),
+                "prompter_vocab": self.prompter.vocab if self.config.use_prompter else None,
+                "prompter_vocab_fps": self.prompter.vocab_fps if self.config.use_prompter else None,
+                "bandit_state": bandit.__dict__,
+                "elite": elite,
+            },
+            tmp_path,
+        )
+        os.replace(tmp_path, pretrained_path)
+        print(f"Saved pretrained checkpoint to {pretrained_path} ({len(self.mol_buffer)} oracle calls)")
 
 
 if __name__ == "__main__":
@@ -752,17 +1269,51 @@ if __name__ == "__main__":
     parser.add_argument("--aggressive_bandit", action="store_true")
     parser.add_argument("--no_bandit", action="store_true")
     parser.add_argument("--tot_offspring_size", type=int, default=None)
+    parser.add_argument("--ga_offspring_size", type=int, default=0, help="GA mutants proposed per round; 0 reuses tot_offspring_size")
     parser.add_argument("--start_rank", type=int, default=0)
     parser.add_argument("--no_mask", action="store_true")
     parser.add_argument("--classic_ga", action="store_true")
     parser.add_argument("--entropy_bonus", action="store_true")
+    parser.add_argument("--kl_coef", type=float, default=0.01)
     parser.add_argument("--eta", type=float, default=1.0)
+    parser.add_argument("--pretrained_dir", type=str, default=None, help="Load per-oracle pretrained checkpoints from this directory")
+    parser.add_argument("--save_pretrained_dir", type=str, default=None, help="Save per-oracle pretrained checkpoints to this directory")
+    parser.add_argument("--ckpt_every_n_calls", type=int, default=10000, help="Re-save save_pretrained_dir every N oracle calls so a timeout keeps stage 1; 0 = final save only")
+    parser.add_argument("--ckpt_min_validity", type=float, default=50.0, help="Only bank a periodic checkpoint when generation validity (percent) exceeds this")
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.01, help="Top-N average must improve by more than this to reset the early-stopping patience")
+    parser.add_argument("--early_stop_patience_calls", type=int, default=5000, help="Oracle calls without an improvement > early_stop_min_delta before stopping; 0 disables the staleness stop")
+    parser.add_argument("--early_stop_top_avg", type=float, default=0.99, help="Stop stage 1 once the top-10 average reaches this (saturation stop)")
+    parser.add_argument("--early_stop_min_calls", type=int, default=25000, help="No early stop of any kind may fire before this many oracle calls")
+    parser.add_argument("--plot_times_per_run", type=int, default=4, help="Diagnostic image snapshots per run, evenly spaced over the oracle budget with the last at run end; 0 disables (wandb stores every image permanently)")
+    parser.add_argument("--batch_size", type=int, default=None, help="Generation batch size")
+    parser.add_argument("--min_tanimoto_dist", type=float, default=0.7, help="Prompter vocab diversity: entries must differ by at least this Tanimoto distance; max allowed pairwise similarity = 1 - min_tanimoto_dist")
+    parser.add_argument("--single_prompt", action="store_true", help="Stage 2: do not combine prompts via crossover; seed each offspring from a single best-performing prompt")
+    parser.add_argument("--ga_elite_parents", type=int, default=1, help="Mutation: draw parents from the top-N of the buffer; 1 = elite GA on the single best molecule")
+    parser.add_argument("--bandit_lr", type=float, default=0.3, help="PeakSeekerBandit quantile step size (eta_q): how fast an arm's reward estimate tracks its observations")
+    parser.add_argument("--bandit_tau", type=float, default=0.3, help="PeakSeekerBandit softmax temperature over arm scores; SMALLER = sharper sampling distribution")
+    parser.add_argument("--bandit_floor", type=float, default=0.005, help="PeakSeekerBandit uniform probability floor mixed into every arm regardless of score")
+    parser.add_argument("--ppo_batch_size", type=int, default=0, help="PPO minibatch and construct_dataset chunk; 0 reuses tot_offspring_size")
+    parser.add_argument("--parent_pool_size", type=int, default=10000, help="Mutation: widen the parent draw to the top-N once the elite parent stops yielding novel mutants for a round")
+    parser.add_argument("--init_random_frac", type=float, default=0.1, help="Stage 1: fraction of max_oracle_calls spent on the random init pool (sampled at --init_eta)")
+    parser.add_argument("--init_ga_frac", type=float, default=0.0, help="Stage 1: fraction of max_oracle_calls spent on a GA init pool seeded from the random pool's best; 0 disables it and leaves mutation to the per-round GA")
+    parser.add_argument("--elite_frac", type=float, default=1.0, help="Per-round selection: 1.0 trains on everything a round scores; below 1 keeps the best elite_frac * offspring_size")
+    parser.add_argument("--init_elite_frac", type=float, default=0.1, help="Stage 1: fraction of the random init pool kept to seed the first reinforce step")
+    parser.add_argument("--init_eta", type=float, default=999.0, help="eta for the random init pool only; large values collapse generation to a single jump to the model's x_1 prediction")
     # Then in your config setup, add:
     args = parser.parse_args()
     device = f"cuda:{args.device}" if len(args.device) == 1 else args.device
     # Convert args to dict for easy passing
     config_dict = dict(vars(args))
     config_dict["device"] = device
+    if args.pretrained_dir:
+        config_dict["start_t"] = 0.95
+        config_dict["use_mutation"] = False
+        config_dict["train_mutation"] = False
+        config_dict["kl_coef"] = 0.0
+        config_dict["vocab_size"] = 10
+        # The budget split is a stage-1 device. Stage 2 has no init pools and no GA, and
+        # trains on every offspring it scores, so elite selection must be a no-op here.
+        config_dict["elite_frac"] = 1.0
     config_dict.pop("start_task")
     config_dict.pop("end_task")
     num_seeds = config_dict.pop("num_seeds")
@@ -810,4 +1361,4 @@ if __name__ == "__main__":
                 torch.cuda.empty_cache()
             except Exception as e:
                 traceback.print_exc()
-                continue
+                raise
