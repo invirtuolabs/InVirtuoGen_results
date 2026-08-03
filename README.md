@@ -78,7 +78,7 @@ python -m in_virtuo_gen.evaluation.downstream \
 Optimize molecular properties using genetic algorithms + reinforcement learning.
 
 
-**Setup Vocab:** (~12 hours - but note that it is already present in the zipped file)
+**Setup Vocab:** (~12 hours on 16 CPU cores)
 ```bash
 mkdir -p data
 wget -O data/frags_zinc250.csv https://zenodo.org/records/16742898/files/frags_zinc250.csv
@@ -86,6 +86,12 @@ python -m in_virtuo_reinforce.preprocess.get_vocab \
     --datapath data/frags_zinc250.csv \
     --outpath in_virtuo_reinforce/vocab/zinc250k.csv
 ```
+
+This step scores all ~250k ZINC molecules against all 23 oracles and writes
+`in_virtuo_reinforce/vocab/zinc250k.csv` (~106 MB), which the `--use_prescreen` path reads.
+The built file is **not** tracked in this repository, since it exceeds GitHub's 100 MB
+per-file limit; rebuild it with the command above. `get_vocab.py` checkpoints per property
+and supports `--resume`, so an interrupted build never re-scores a finished oracle.
 
 
 ### With Prescreening ZINC250k:
@@ -244,6 +250,24 @@ python -m in_virtuo_reinforce.genetic_ppo --ckpt checkpoints/invirtuo_gen.ckpt -
 | valsartan smarts         | 0.870                  | **0.927** | 0.766       | 0.715  | 0.000                             | 0.150                                 |
 | zaleplon mpo             | 0.617                  | 0.605     | 0.576       | **0.653** | 0.520                           | 0.458                                 |
 | **Sum**                  | **18.893**             | 18.782    | 17.831      | 17.758 | 16.131                            | 14.349                                |
+
+### 3.c Comparison in the Unlimited-Oracle-Call Regime (Graph-GRPO)
+
+Some methods, notably Graph-GRPO, report PMO scores without counting the oracle calls spent on
+training the generative model, and only count the calls of the final optimization run. We consider
+this at odds with the purpose of the benchmark, which is sample efficiency with respect to an
+expensive oracle, but report results under that convention for completeness (see the appendix of
+the paper).
+
+Those experiments use a two-phase protocol (a finetuning phase of at most 100k oracle calls per
+task, followed by the standard 10k-call PMO run from the finetuned policy) that is **not** part of
+the code on `main`. The code, submission scripts, per-oracle result CSVs and table-building recipe
+for them live on the [`grpo`](https://github.com/invirtuolabs/InVirtuoGen_results/tree/grpo) branch:
+
+```bash
+git checkout grpo
+cat EVAL_RUNS.md   # which run produced which table, and the exact commands
+```
 
 ## 4. Lead Optimization:
 (We were unable to install the required dependencies for these experiments in the Dockerfile on an aarch64 environment. On ARM systems, the setup works by simply running pip install -r requirements.txt). Also we can not guarantee exact reproducability here, due to the stochasticity of the docking with openVINA.

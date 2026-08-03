@@ -13,4 +13,5 @@ oracle
 checkpoints
 logs
 data
+.deps
 
